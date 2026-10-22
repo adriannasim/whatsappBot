@@ -1,0 +1,122 @@
+{
+  "_comment": "Import into Pterodactyl 1.x, then replace OWNER/REPO in Docker Images with your actual GHCR image. This runtime uses BOT_MODE and does not evaluate STARTUP.",
+  "meta": {
+    "version": "PTDL_v2",
+    "update_url": null
+  },
+  "exported_at": "2026-10-22T00:00:00+00:00",
+  "name": "WhatsApp Summary Bot",
+  "author": "maintainer@example.invalid",
+  "description": "Personal WhatsApp group summaries through Baileys. Node 24 and dependencies are baked into the image; no Chrome browser is needed. Keep the server volume across deployments. Start in check mode to verify dependencies before pairing.",
+  "features": null,
+  "docker_images": {
+    "WhatsApp Summary Bot (replace OWNER/REPO)": "ghcr.io/OWNER/REPO:production"
+  },
+  "file_denylist": [],
+  "startup": "BOT_MODE={{BOT_MODE}}",
+  "config": {
+    "files": "{}",
+    "startup": "{\"done\":[\"Ready in \",\"Runtime check passed.\"]}",
+    "logs": "{}",
+    "stop": "^C"
+  },
+  "scripts": {
+    "installation": {
+      "script": "#!/bin/sh\n# Runtime source and dependencies are provided by the Docker image.\n# Preserve every file in the server volume.\nexit 0\n",
+      "container": "debian:bookworm-slim",
+      "entrypoint": "sh"
+    }
+  },
+  "variables": [
+    {
+      "name": "Bot mode",
+      "description": "Use check first, groups to pair/list WhatsApp groups, models/account to inspect ChatGPT, then run for normal operation. Login/logout are maintenance modes; the OAuth callback remains container-local.",
+      "env_variable": "BOT_MODE",
+      "default_value": "check",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:run,groups,models,account,check,login,logout",
+      "field_type": "text"
+    },
+    {
+      "name": "WhatsApp authentication directory",
+      "description": "Persistent Baileys credentials and encryption keys, not a message archive. Keep under /home/container. Old whatsapp-web.js sessions cannot be reused; pair once after migration.",
+      "env_variable": "WA_AUTH_DIR",
+      "default_value": "./.baileys-auth",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:500",
+      "field_type": "text"
+    },
+    {
+      "name": "AI authentication mode",
+      "description": "chatgpt uses the separately provisioned OAuth connection. api-key is explicitly selected API billing; put the key in private .env, never Git or the image.",
+      "env_variable": "AI_AUTH_MODE",
+      "default_value": "chatgpt",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:chatgpt,api-key",
+      "field_type": "text"
+    },
+    {
+      "name": "Model ID",
+      "description": "Exact model ID from models mode; blank chooses the account catalog's first available model. Panel environment values override .env.",
+      "env_variable": "OPENAI_MODEL",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:200",
+      "field_type": "text"
+    },
+    {
+      "name": "Allowed WhatsApp groups",
+      "description": "Comma-separated exact group IDs printed by groups mode, including @g.us. Required for run mode.",
+      "env_variable": "ALLOWED_GROUP_IDS",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:2000",
+      "field_type": "text"
+    },
+    {
+      "name": "History fetch cap",
+      "description": "Maximum recent messages to attempt loading per command. No separate message archive is created.",
+      "env_variable": "MAX_HISTORY_MESSAGES",
+      "default_value": "3000",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:1|max:10000",
+      "field_type": "text"
+    },
+    {
+      "name": "On-demand history timeout",
+      "description": "Maximum milliseconds to wait for the primary phone to return a requested history range. Keep the bot phone online. This panel value overrides .env.",
+      "env_variable": "HISTORY_TIMEOUT_MS",
+      "default_value": "60000",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:5000|max:120000",
+      "field_type": "text"
+    },
+    {
+      "name": "Expected image revision",
+      "description": "Deployment writes the tested full Git commit SHA. Startup refuses an older or mismatched image. Leave blank only during initial manual setup.",
+      "env_variable": "EXPECTED_REVISION",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "nullable|string|max:64",
+      "field_type": "text"
+    },
+    {
+      "name": "ChatGPT loopback login port",
+      "description": "For node-admin maintenance with an appropriate local callback tunnel. Publishing this allocation does not expose container loopback; do not make the callback public.",
+      "env_variable": "CHATGPT_LOGIN_PORT",
+      "default_value": "17778",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:1024|max:65535",
+      "field_type": "text"
+    }
+  ]
+}

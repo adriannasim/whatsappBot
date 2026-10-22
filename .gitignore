@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.wwebjs_auth/
+.wwebjs_cache/
+.baileys-auth/
+.baileys-auth*/
+.chatgpt-auth/
+data/
+*.zip
+*.log

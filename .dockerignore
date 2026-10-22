@@ -1,0 +1,12 @@
+# Explicit build-context allowlist: no auth files, .env, Git data, or archives.
+**
+!package.json
+!package-lock.json
+!src/
+!src/**
+!scripts/
+!scripts/check-runtime.mjs
+!deploy/
+!deploy/pterodactyl/
+!deploy/pterodactyl/Dockerfile
+!deploy/pterodactyl/entrypoint.sh

@@ -1,0 +1,283 @@
+const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
+const MAX_EARLY_EVENTS = 32;
+const MAX_CHUNKS_PER_PAGE = 128;
+const MAX_QUEUED_REQUESTS = 20;
+
+function unavailable(message) {
+  const error = new Error(message);
+  error.code = 'HISTORY_UNAVAILABLE';
+  return error;
+}
+
+function timestampSeconds(value) {
+  let number;
+  if (typeof value === 'number') number = value;
+  else if (typeof value === 'bigint') number = Number(value);
+  else if (value && typeof value.toNumber === 'function') number = value.toNumber();
+  else if (value && Number.isInteger(value.low) && Number.isInteger(value.high)) {
+    number = (value.high >>> 0) * 0x100000000 + (value.low >>> 0);
+  }
+  if (!Number.isSafeInteger(number) || number <= 0 || !Number.isSafeInteger(number * 1000)) {
+    throw unavailable('WhatsApp returned an invalid message timestamp. Please try again.');
+  }
+  return number;
+}
+
+function normalizeParticipant(jid) {
+  return typeof jid === 'string' ? jid.replace(/:\d+(?=@)/, '') : '';
+}
+
+function matchesParticipant(key, participant) {
+  if (!participant) return true;
+  const wanted = normalizeParticipant(participant);
+  return [key.participant, key.participantAlt].some((value) => normalizeParticipant(value) === wanted);
+}
+
+function byteLength(value) {
+  return Buffer.byteLength(JSON.stringify(value, (_, item) => typeof item === 'bigint' ? item.toString() : item));
+}
+
+function validateRequest({ groupId, startId, startParticipant, startFromMe, endKey, endTimestamp } = {}) {
+  if (typeof groupId !== 'string' || !groupId.endsWith('@g.us')) throw new TypeError('groupId must be a WhatsApp group JID');
+  if (typeof startId !== 'string' || !startId || typeof endKey?.id !== 'string' || !endKey.id) {
+    throw new TypeError('startId and endKey.id must be non-empty message IDs');
+  }
+  if (endKey.remoteJid !== groupId || typeof endKey.fromMe !== 'boolean') {
+    throw new TypeError('endKey must be the actual command key from this group');
+  }
+  if (startParticipant !== undefined && (typeof startParticipant !== 'string' || !startParticipant)) {
+    throw new TypeError('startParticipant must be a non-empty JID');
+  }
+  if (startFromMe !== undefined && typeof startFromMe !== 'boolean') throw new TypeError('startFromMe must be a boolean');
+  if (startId === endKey.id) throw unavailable('Please reply to a message that comes before your !summarise command.');
+  return { groupId, startId, startParticipant, startFromMe, endKey: { ...endKey }, endTimestamp: timestampSeconds(endTimestamp) };
+}
+
+/**
+ * Fetch history from the primary phone only while a command is running.
+ * Baileys emits reverse chronological pages and returns a request ID, not messages.
+ * endTimestamp uses Baileys' Unix seconds; fetchMessageHistory requires milliseconds.
+ * A response without progress metadata is considered settled after settleMs of quiet.
+ * This returns the available range, not a guarantee that WhatsApp retained every message.
+ */
+export function createOnDemandHistory({
+  getSocket,
+  maxMessages = 3000,
+  timeoutMs = 30000,
+  settleMs = 750,
+  onDemandType = 6, // proto.HistorySync.HistorySyncType.ON_DEMAND
+} = {}) {
+  if (typeof getSocket !== 'function') throw new TypeError('getSocket must be a function');
+  if (!Number.isSafeInteger(maxMessages) || maxMessages < 1) throw new TypeError('maxMessages must be a positive integer');
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new TypeError('timeoutMs must be a positive integer');
+  if (!Number.isSafeInteger(settleMs) || settleMs < 0) throw new TypeError('settleMs must be a non-negative integer');
+  if (!Number.isSafeInteger(onDemandType) || onDemandType < 0) throw new TypeError('onDemandType must be a non-negative integer');
+
+  const queue = [];
+  let active;
+  let closed = false;
+
+  async function run(request, controller) {
+    const socket = getSocket();
+    if (typeof socket?.fetchMessageHistory !== 'function' || typeof socket?.ev?.on !== 'function' || typeof socket?.ev?.off !== 'function') {
+      throw unavailable('WhatsApp is not connected. Please try again after it reconnects.');
+    }
+    const reverseMessages = [];
+    const seen = new Set();
+    let retainedBytes = 0;
+    let page;
+    let deadline;
+    let abort;
+
+    const failure = new Promise((_, reject) => {
+      abort = () => reject(controller.signal.reason);
+      controller.signal.addEventListener('abort', abort, { once: true });
+      deadline = setTimeout(() => reject(unavailable('WhatsApp did not finish sending history. Keep the bot account\'s phone online and try again, or reply to a more recent message.')), timeoutMs);
+    });
+    // Attach immediately: socket events can arrive before a page starts awaiting it.
+    failure.catch(() => {});
+
+    function finishPageSoon() {
+      clearTimeout(page?.settleTimer);
+      if (!page || (page.progress !== undefined && page.progress < 100)) return;
+      page.settleTimer = setTimeout(() => page?.resolve(), settleMs);
+    }
+
+    function receiveForPage(event) {
+      if (!page || event.peerDataRequestSessionId !== page.id) return;
+      try {
+        if (!Array.isArray(event.messages)) throw unavailable('WhatsApp returned malformed history. Please try again.');
+        const rows = [];
+        for (const message of event.messages) {
+          if (message?.key?.remoteJid !== request.groupId) continue;
+          if (typeof message.key.id !== 'string' || !message.key.id || typeof message.key.fromMe !== 'boolean') {
+            throw unavailable('WhatsApp returned a message without a valid key. Please try again.');
+          }
+          timestampSeconds(message.messageTimestamp);
+          page.bytes += byteLength(message);
+          if (++page.count > maxMessages + 100 || retainedBytes + page.bytes > MAX_BUFFER_BYTES) {
+            throw unavailable('That history response is too large. Please reply to a more recent message.');
+          }
+          rows.push(message);
+        }
+        // Empty responses can signal exhaustion. Ignore unrelated-group-only events.
+        if (!rows.length && event.messages.length) return;
+        if (event.progress != null) {
+          if (!Number.isFinite(event.progress) || event.progress < 0 || event.progress > 100) {
+            throw unavailable('WhatsApp returned invalid history progress. Please try again.');
+          }
+          page.progress = Math.max(page.progress ?? 0, event.progress);
+        }
+        if (event.chunkOrder != null && (!Number.isSafeInteger(event.chunkOrder) || event.chunkOrder < 0)) {
+          throw unavailable('WhatsApp returned an invalid history chunk. Please try again.');
+        }
+        if (page.chunks.length >= MAX_CHUNKS_PER_PAGE) throw unavailable('WhatsApp sent too many history chunks. Please try a more recent starting message.');
+        page.chunks.push({ rows, order: event.chunkOrder, received: page.chunks.length });
+        finishPageSoon();
+      } catch (error) {
+        page.reject(error.code === 'HISTORY_UNAVAILABLE' ? error : unavailable('WhatsApp returned malformed history. Please try again.'));
+      }
+    }
+
+    function onHistory(event) {
+      if (!page || event?.syncType !== onDemandType || typeof event.peerDataRequestSessionId !== 'string' || !event.peerDataRequestSessionId) return;
+      if (page.id) {
+        receiveForPage(event);
+      } else {
+        // Events can arrive before fetchMessageHistory resolves with its request ID.
+        // Bound this short-lived buffer and replay only the exact matching session.
+        try {
+          const relevant = Array.isArray(event.messages)
+            ? event.messages.filter((message) => message?.key?.remoteJid === request.groupId)
+            : event.messages;
+          if (Array.isArray(relevant) && event.messages.length && !relevant.length) return;
+          const snapshot = {
+            messages: relevant,
+            peerDataRequestSessionId: event.peerDataRequestSessionId,
+            progress: event.progress,
+            chunkOrder: event.chunkOrder,
+          };
+          page.earlyBytes += byteLength(snapshot);
+          if (page.early.length >= MAX_EARLY_EVENTS || page.earlyBytes + retainedBytes > MAX_BUFFER_BYTES || (Array.isArray(relevant) && relevant.length > maxMessages + 100)) {
+            throw unavailable('That history response is too large. Please reply to a more recent message.');
+          }
+          page.early.push(snapshot);
+        } catch (error) {
+          page.reject(error.code === 'HISTORY_UNAVAILABLE' ? error : unavailable('WhatsApp returned malformed history. Please try again.'));
+        }
+      }
+    }
+
+    function onConnection(update) {
+      if (update?.connection === 'close') controller.abort(unavailable('WhatsApp disconnected while loading history. Please try again after it reconnects.'));
+    }
+
+    socket.ev.on('messaging-history.set', onHistory);
+    socket.ev.on('connection.update', onConnection);
+    try {
+      let cursorKey = request.endKey;
+      let cursorTimestamp = request.endTimestamp;
+      while (reverseMessages.length < maxMessages) {
+        let resolvePage;
+        let rejectPage;
+        const completed = new Promise((resolve, reject) => { resolvePage = resolve; rejectPage = reject; });
+        completed.catch(() => {});
+        page = { id: undefined, chunks: [], early: [], earlyBytes: 0, bytes: 0, count: 0, resolve: resolvePage, reject: rejectPage };
+        const count = Math.min(100, maxMessages - reverseMessages.length);
+        const session = await Promise.race([
+          Promise.resolve().then(() => {
+            if (controller.signal.aborted) throw controller.signal.reason;
+            return socket.fetchMessageHistory(count, cursorKey, cursorTimestamp * 1000);
+          }),
+          completed.then(() => { throw unavailable('WhatsApp returned history before its request was identified. Please try again.'); }),
+          failure,
+        ]);
+        if (typeof session !== 'string' || !session) throw unavailable('WhatsApp did not identify the history request. Please try again.');
+        page.id = session;
+        const early = page.early;
+        page.early = [];
+        page.earlyBytes = 0;
+        for (const event of early) receiveForPage(event);
+        await Promise.race([completed, failure]);
+        clearTimeout(page.settleTimer);
+
+        // Preserve protocol order for equal timestamps. Chunk numbers can restore
+        // out-of-order delivery; otherwise retain the order supplied by Baileys.
+        const chunks = page.chunks;
+        if (chunks.length && chunks.every((chunk) => chunk.order != null)) {
+          chunks.sort((a, b) => a.order - b.order || a.received - b.received);
+        }
+        let rows = chunks.flatMap((chunk) => chunk.rows);
+        const cursorIndex = rows.findIndex((message) => message.key.id === cursorKey.id && matchesParticipant(message.key, cursorKey.participant));
+        if (cursorIndex !== -1) rows = rows.slice(cursorIndex + 1);
+
+        let oldest;
+        let previousTimestamp = cursorTimestamp;
+        for (const message of rows) {
+          if (message.key.id === request.endKey.id || seen.has(message.key.id)) continue;
+          const timestamp = timestampSeconds(message.messageTimestamp);
+          if (timestamp > previousTimestamp) {
+            throw unavailable('WhatsApp returned history in an unexpected order. Please try again with a more recent starting message.');
+          }
+          previousTimestamp = timestamp;
+          seen.add(message.key.id);
+          reverseMessages.push(message);
+          retainedBytes += byteLength(message);
+          oldest = message;
+          const anchorSenderMatches = request.startFromMe === true
+            ? message.key.fromMe === true
+            : (request.startFromMe !== false || message.key.fromMe === false) && matchesParticipant(message.key, request.startParticipant);
+          if (message.key.id === request.startId && anchorSenderMatches) {
+            return Object.freeze(reverseMessages.slice().reverse());
+          }
+          if (reverseMessages.length >= maxMessages) break;
+        }
+        if (!oldest) break;
+        cursorKey = { ...oldest.key };
+        cursorTimestamp = timestampSeconds(oldest.messageTimestamp);
+        page = undefined;
+      }
+      throw unavailable('I could not load the starting message within the available history limit. Keep the bot account\'s phone online, or reply to a more recent message.');
+    } finally {
+      clearTimeout(deadline);
+      clearTimeout(page?.settleTimer);
+      controller.signal.removeEventListener('abort', abort);
+      socket.ev.off('messaging-history.set', onHistory);
+      socket.ev.off('connection.update', onConnection);
+      page = undefined;
+      reverseMessages.length = 0;
+      seen.clear();
+    }
+  }
+
+  function startNext() {
+    if (active || closed || !queue.length) return;
+    const job = queue.shift();
+    const controller = new AbortController();
+    active = controller;
+    run(job.request, controller).then(job.resolve, job.reject).finally(() => {
+      active = undefined;
+      startNext();
+    });
+  }
+
+  return {
+    load(options) {
+      if (closed) return Promise.reject(unavailable('The WhatsApp history service is closed.'));
+      let request;
+      try { request = validateRequest(options); } catch (error) { return Promise.reject(error); }
+      if (queue.length >= MAX_QUEUED_REQUESTS) return Promise.reject(unavailable('Too many summaries are waiting. Please try again shortly.'));
+      return new Promise((resolve, reject) => {
+        queue.push({ request, resolve, reject });
+        startNext();
+      });
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      const error = unavailable('The WhatsApp history service was closed. Please try again after it reconnects.');
+      active?.abort(error);
+      for (const job of queue.splice(0)) job.reject(error);
+    },
+  };
+}

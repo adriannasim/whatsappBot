@@ -1,0 +1,90 @@
+name: Test and deploy to Google VM
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: google-vm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run runtime:check
+      - run: npm test
+
+  deploy:
+    needs: test
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request' &&
+      vars.GOOGLE_VM_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      VM_HOST: ${{ secrets.VM_HOST }}
+      VM_USER: ${{ secrets.VM_USER }}
+      VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+      VM_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
+      VM_SSH_PORT: ${{ vars.VM_SSH_PORT || '22' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Validate SSH configuration and prepare the tested source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo 'Invalid commit SHA.' >&2; exit 1; }
+          [[ "$VM_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || { echo 'Set VM_HOST to the reachable IPv4 address or DNS name.' >&2; exit 1; }
+          [[ "$VM_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo 'Set VM_USER to the non-root bot user.' >&2; exit 1; }
+          [[ "$VM_USER" != root ]] || { echo 'Use a non-root bot user.' >&2; exit 1; }
+          [[ "$VM_SSH_PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$VM_SSH_PORT >= 1 && 10#$VM_SSH_PORT <= 65535 )) || { echo 'Invalid VM_SSH_PORT.' >&2; exit 1; }
+          [[ -n "$VM_SSH_KEY" && -n "$VM_KNOWN_HOSTS" ]] || { echo 'Configure VM_SSH_KEY and VM_KNOWN_HOSTS.' >&2; exit 1; }
+          umask 077
+          printf '%s\n' "$VM_SSH_KEY" > "$RUNNER_TEMP/bot-deploy-key"
+          printf '%s\n' "$VM_KNOWN_HOSTS" > "$RUNNER_TEMP/bot-known-hosts"
+          ssh-keygen -y -P '' -f "$RUNNER_TEMP/bot-deploy-key" >/dev/null
+          git archive --format=tar --output="$RUNNER_TEMP/bot-source.tar" "$GITHUB_SHA" \
+            package.json package-lock.json src scripts/check-runtime.mjs
+      - name: Upload source and deploy on the VM architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only the validated SHA and fixed paths enter the remote shell command.
+          ssh_options=(
+            -i "$RUNNER_TEMP/bot-deploy-key"
+            -o BatchMode=yes -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$RUNNER_TEMP/bot-known-hosts"
+            -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+          )
+          destination="$VM_USER@$VM_HOST"
+          remote_path="apps/whatsapp-summary-bot/incoming/$GITHUB_SHA"
+          ssh "${ssh_options[@]}" -p "$VM_SSH_PORT" "$destination" \
+            "cd && umask 077 && mkdir -p '$remote_path'"
+          scp "${ssh_options[@]}" -P "$VM_SSH_PORT" \
+            "$RUNNER_TEMP/bot-source.tar" "$destination:$remote_path/source.tar"
+          scp "${ssh_options[@]}" -P "$VM_SSH_PORT" \
+            deploy/google-vm/deploy.sh "$destination:$remote_path/deploy.sh"
+          ssh "${ssh_options[@]}" -p "$VM_SSH_PORT" "$destination" \
+            "cd && bash '$remote_path/deploy.sh' '$GITHUB_SHA' \"\$HOME/$remote_path/source.tar\""
+      - name: Remove temporary SSH credentials
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/bot-deploy-key" "$RUNNER_TEMP/bot-known-hosts"

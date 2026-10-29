@@ -1,0 +1,638 @@
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -273,6 +273,16 @@
+ - **History unavailable or timed out:** keep the bot phone online, try a recent
+   starting message visible on it, and send a new command. Increasing
+   `HISTORY_TIMEOUT_MS` may help a slow response but cannot restore missing history.
++  The bot reports its specific history failure in the group and in the server log
++  as `History retrieval failed: ...`. On the Google VM, inspect recent failures
++  with `sudo journalctl -u whatsapp-summary-bot.service --since '10 minutes ago' --no-pager`.
++  If fresh messages also fail while WhatsApp is open on the bot phone, use this
++  specific failure to diagnose the request; changing the AI model will not fix
++  history retrieval. The pinned Baileys version filters previously returned
++  history in its event buffer, so this bot observes on-demand responses before
++  that buffering, only for the duration of a summary request. Incoming history
++  accepts WhatsApp's omitted `fromMe` flag as false, and checks alternate sender
++  identifiers against Baileys' verified phone-number/LID mappings.
+ - **QR needed after upgrading:** the old whatsapp-web.js session is incompatible;
+   link Baileys as a new device with `npm run groups`.
+ - **ChatGPT sign-in required:** stop the bot and run `npm run login`; use
+diff --git a/src/history.js b/src/history.js
+--- a/src/history.js
++++ b/src/history.js
+@@ -1,12 +1,12 @@
++import { HistoryUnavailableError } from './history-error.js';
++
+ const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
+ const MAX_EARLY_EVENTS = 32;
+ const MAX_CHUNKS_PER_PAGE = 128;
+ const MAX_QUEUED_REQUESTS = 20;
+ 
+ function unavailable(message) {
+-  const error = new Error(message);
+-  error.code = 'HISTORY_UNAVAILABLE';
+-  return error;
++  return new HistoryUnavailableError(message);
+ }
+ 
+ function timestampSeconds(value) {
+@@ -97,6 +97,24 @@
+     // Attach immediately: socket events can arrive before a page starts awaiting it.
+     failure.catch(() => {});
+ 
++    async function matchesVerifiedParticipant(key, participant) {
++      if (matchesParticipant(key, participant)) return true;
++      const mapping = socket.signalRepository?.lidMapping;
++      const wanted = normalizeParticipant(participant);
++      const lookup = /@(lid|hosted\.lid)$/.test(wanted) ? mapping?.getPNForLID
++        : /@(s\.whatsapp\.net|hosted)$/.test(wanted) ? mapping?.getLIDForPN : undefined;
++      if (typeof lookup !== 'function') return false;
++      // History protobufs do not carry participantAlt. Baileys stores verified
++      // PN/LID mappings before emitting history, so resolve only a matching
++      // message ID, after its response arrived. Never equate unrelated users
++      // merely because their message IDs or timestamp happen to match.
++      const alias = await Promise.race([
++        Promise.resolve().then(() => lookup.call(mapping, wanted)).catch(() => undefined),
++        failure,
++      ]);
++      return typeof alias === 'string' && Boolean(alias) && matchesParticipant(key, alias);
++    }
++
+     function finishPageSoon() {
+       clearTimeout(page?.settleTimer);
+       if (!page || (page.progress !== undefined && page.progress < 100)) return;
+@@ -108,11 +126,16 @@
+       try {
+         if (!Array.isArray(event.messages)) throw unavailable('WhatsApp returned malformed history. Please try again.');
+         const rows = [];
+-        for (const message of event.messages) {
++        for (let message of event.messages) {
+           if (message?.key?.remoteJid !== request.groupId) continue;
+-          if (typeof message.key.id !== 'string' || !message.key.id || typeof message.key.fromMe !== 'boolean') {
++          if (typeof message.key.id !== 'string' || !message.key.id
++            || (message.key.fromMe != null && typeof message.key.fromMe !== 'boolean')) {
+             throw unavailable('WhatsApp returned a message without a valid key. Please try again.');
+           }
++          // Protobuf optional false values may be absent (decoded as null).
++          // Baileys treats these as incoming messages. Copy rather than mutate
++          // the raw message shared with its event buffer and other consumers.
++          if (message.key.fromMe == null) message = { ...message, key: { ...message.key, fromMe: false } };
+           timestampSeconds(message.messageTimestamp);
+           page.bytes += byteLength(message);
+           if (++page.count > maxMessages + 100 || retainedBytes + page.bytes > MAX_BUFFER_BYTES) {
+@@ -172,9 +195,27 @@
+       if (update?.connection === 'close') controller.abort(unavailable('WhatsApp disconnected while loading history. Please try again after it reconnects.'));
+     }
+ 
+-    socket.ev.on('messaging-history.set', onHistory);
+-    socket.ev.on('connection.update', onConnection);
++    const originalEmit = socket.ev.emit;
++    let observingRawHistory = false;
++    function emitWithHistoryObserver(...args) {
++      if (args[0] === 'messaging-history.set') onHistory(args[1]);
++      return Reflect.apply(originalEmit, this, args);
++    }
+     try {
++      if (typeof originalEmit === 'function') {
++        // Baileys buffers history events and deduplicates message IDs across
++        // requests. Observe each raw response before that buffer can drop an
++        // overlapping range or merge its session/chunk metadata. Keep the
++        // original emission intact for Baileys and other consumers, and do not
++        // also subscribe to the later buffered copy. This observer lives only
++        // for this command and retains no conversation between commands.
++        socket.ev.emit = emitWithHistoryObserver;
++        observingRawHistory = true;
++      } else {
++        // Compatibility with adapters that only expose subscription methods.
++        socket.ev.on('messaging-history.set', onHistory);
++      }
++      socket.ev.on('connection.update', onConnection);
+       let cursorKey = request.endKey;
+       let cursorTimestamp = request.endTimestamp;
+       while (reverseMessages.length < maxMessages) {
+@@ -208,7 +249,21 @@
+           chunks.sort((a, b) => a.order - b.order || a.received - b.received);
+         }
+         let rows = chunks.flatMap((chunk) => chunk.rows);
+-        const cursorIndex = rows.findIndex((message) => message.key.id === cursorKey.id && matchesParticipant(message.key, cursorKey.participant));
++        let cursorIndex = -1;
++        let cursorIdPresent = false;
++        for (let index = 0; index < rows.length; index++) {
++          const key = rows[index].key;
++          if (key.id !== cursorKey.id) continue;
++          cursorIdPresent = true;
++          if (key.fromMe === cursorKey.fromMe
++            && await matchesVerifiedParticipant(key, cursorKey.participant)) {
++            cursorIndex = index;
++            break;
++          }
++        }
++        if (cursorIdPresent && cursorIndex === -1) {
++          throw unavailable('WhatsApp returned a history boundary whose sender could not be verified. Please try again with a new !summarise command.');
++        }
+         if (cursorIndex !== -1) rows = rows.slice(cursorIndex + 1);
+ 
+         let oldest;
+@@ -224,11 +279,13 @@
+           reverseMessages.push(message);
+           retainedBytes += byteLength(message);
+           oldest = message;
+-          const anchorSenderMatches = request.startFromMe === true
+-            ? message.key.fromMe === true
+-            : (request.startFromMe !== false || message.key.fromMe === false) && matchesParticipant(message.key, request.startParticipant);
+-          if (message.key.id === request.startId && anchorSenderMatches) {
+-            return Object.freeze(reverseMessages.slice().reverse());
++          if (message.key.id === request.startId) {
++            const anchorSenderMatches = request.startFromMe === true
++              ? message.key.fromMe === true
++              : (request.startFromMe !== false || message.key.fromMe === false)
++                && await matchesVerifiedParticipant(message.key, request.startParticipant);
++            if (anchorSenderMatches) return Object.freeze(reverseMessages.slice().reverse());
++            throw unavailable('WhatsApp returned the starting message but its sender could not be verified. Please try again with a new !summarise command.');
+           }
+           if (reverseMessages.length >= maxMessages) break;
+         }
+@@ -242,7 +299,11 @@
+       clearTimeout(deadline);
+       clearTimeout(page?.settleTimer);
+       controller.signal.removeEventListener('abort', abort);
+-      socket.ev.off('messaging-history.set', onHistory);
++      if (observingRawHistory) {
++        if (socket.ev.emit === emitWithHistoryObserver) socket.ev.emit = originalEmit;
++      } else {
++        socket.ev.off('messaging-history.set', onHistory);
++      }
+       socket.ev.off('connection.update', onConnection);
+       page = undefined;
+       reverseMessages.length = 0;
+diff --git a/src/history-error.js b/src/history-error.js
+new file mode 100644
+--- /dev/null
++++ b/src/history-error.js
+@@ -0,0 +1,10 @@
++/** An application-authored history failure, safe to explain in chat and logs.
++ * Only pass fixed guidance here, never a provider error or message content.
++ */
++export class HistoryUnavailableError extends Error {
++  constructor(message) {
++    super(message);
++    this.name = 'HistoryUnavailableError';
++    this.code = 'HISTORY_UNAVAILABLE';
++  }
++}
+diff --git a/src/service.js b/src/service.js
+--- a/src/service.js
++++ b/src/service.js
+@@ -1,3 +1,5 @@
++import { HistoryUnavailableError } from './history-error.js';
++
+ const MAX_REPLY_LENGTH = 3500;
+ const COMMAND_TTL_MS = 60 * 60 * 1000;
+ const MAX_REMEMBERED_COMMANDS = 1000;
+@@ -38,6 +40,7 @@
+   summarize,
+   reply,
+   onPause = () => {},
++  onError = () => {},
+   now = () => Date.now(),
+   cooldownMs = 30_000,
+ }) {
+@@ -128,6 +131,13 @@
+       lastSuccess.set(groupId, now());
+       return 'summarised';
+     } catch (error) {
++      if (error?.code === 'HISTORY_UNAVAILABLE') {
++        // Only our fixed recovery guidance is safe to log or send to the group.
++        const detail = error instanceof HistoryUnavailableError
++          ? error.message : 'WhatsApp history is unavailable.';
++        try { onError(`History retrieval failed: ${detail}`); }
++        catch { /* Diagnostics must not prevent the recovery reply. */ }
++      }
+       if (error?.code === 'PLAN_LIMIT') {
+         planPaused = true;
+         try { onPause(); } catch { /* Logging must not prevent the user-facing reply. */ }
+@@ -141,7 +151,8 @@
+         SUBSCRIPTION_NOT_ENABLED: 'The bot owner needs to authorise ChatGPT plan usage before summaries can continue.',
+         MODEL_UNAVAILABLE: 'The configured summary model is unavailable. The bot owner needs to choose another available model.',
+       };
+-      const message = planMessages[error?.code] || (error?.code === 'HISTORY_UNAVAILABLE'
++      const message = error instanceof HistoryUnavailableError ? error.message
++        : planMessages[error?.code] || (error?.code === 'HISTORY_UNAVAILABLE'
+         ? 'I could not retrieve that starting message or the requested range from WhatsApp. Keep the bot phone online, then reply to a newer starting message and try !summarise again.'
+         : error?.code === 'INPUT_TOO_LARGE'
+           ? 'That conversation is too long for one summary. Reply to a newer starting message and send !summarise again.'
+diff --git a/src/bot.js b/src/bot.js
+--- a/src/bot.js
++++ b/src/bot.js
+@@ -33,7 +33,7 @@
+   expiryTimer.unref?.();
+ 
+   const handle = createSummaryService({
+-    summarize, onPause, now,
++    summarize, onPause, onError, now,
+     loadMessages: async ({ groupId, startId, endId }) => {
+       const context = activeCommands.get(keyFor(groupId, endId));
+       if (closed || !context || context.socket !== getSocket()) throw new Error('Connection changed');
+diff --git a/test/history-buffer.test.js b/test/history-buffer.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/history-buffer.test.js
+@@ -0,0 +1,177 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { EventEmitter } from 'node:events';
++import { makeEventBuffer, processHistoryMessage, proto } from '@whiskeysockets/baileys';
++import { createOnDemandHistory } from '../src/history.js';
++
++const GROUP = '123@g.us';
++const message = (id, timestamp) => ({
++  key: { remoteJid: GROUP, id, fromMe: false, participant: '456@s.whatsapp.net' },
++  messageTimestamp: timestamp,
++  message: { conversation: `Message ${id}` },
++});
++const request = () => ({
++  groupId: GROUP, startId: 'anchor', endKey: message('command', 1004).key, endTimestamp: 1004,
++});
++const ids = rows => rows.map(row => row.key.id);
++const logger = { debug() {}, trace() {}, warn() {} };
++
++// Exercise the pinned Baileys protobuf decoder and event buffer instead of
++// assuming that its public history event preserves each raw response.
++function historyEvent(session, messages, { progress, chunkOrder } = {}) {
++  const decoded = proto.HistorySync.decode(proto.HistorySync.encode({
++    syncType: proto.HistorySync.HistorySyncType.ON_DEMAND,
++    ...(progress == null ? {} : { progress }),
++    conversations: [{ id: GROUP, messages: messages.map(value => ({ message: value })) }],
++  }).finish());
++  return { ...processHistoryMessage(decoded), peerDataRequestSessionId: session, chunkOrder };
++}
++
++function fixture(t, handler, options = {}) {
++  const ev = makeEventBuffer(logger);
++  const originalEmit = ev.emit;
++  const delivered = [];
++  const calls = [];
++  ev.on('messaging-history.set', event => delivered.push(event));
++  const socket = {
++    ev,
++    async fetchMessageHistory(count, key, timestampMs) {
++      const session = `request-${calls.length + 1}`;
++      calls.push({ count, key, timestampMs, session });
++      await handler({ ev, calls, session, emit: (rows, extra) => ev.emit('messaging-history.set', historyEvent(session, rows, extra)) });
++      return session;
++    },
++  };
++  const history = createOnDemandHistory({ getSocket: () => socket, settleMs: 1, timeoutMs: 250, ...options });
++  t.after(() => { history.close(); ev.destroy(); });
++  return { ev, socket, originalEmit, delivered, calls, history };
++}
++
++test('repeated and overlapping commands receive history that Baileys deduplicates for buffered consumers', async t => {
++  const anchor = message('anchor', 1001);
++  const middle = message('middle', 1002);
++  const newer = message('newer', 1003);
++  const f = fixture(t, ({ ev, calls, emit }) => {
++    ev.buffer();
++    emit(calls.length === 1 ? [middle, anchor] : [newer, middle, anchor], { progress: 100 });
++    ev.flush();
++  });
++  assert.deepEqual(ids(await f.history.load(request())), ['anchor', 'middle']);
++  assert.equal(f.ev.emit, f.originalEmit);
++  assert.deepEqual(ids(await f.history.load(request())), ['anchor', 'middle', 'newer']);
++  assert.equal(f.ev.emit, f.originalEmit);
++  assert.deepEqual(ids(await f.history.load(request())), ['anchor', 'middle', 'newer']);
++  assert.equal(f.ev.emit, f.originalEmit);
++  // The original buffer still behaves normally for its existing consumers.
++  assert.deepEqual(f.delivered.map(event => ids(event.messages)), [['middle', 'anchor'], ['newer'], []]);
++});
++
++test('raw session and chunk metadata survive a buffer that merges unrelated sessions and out-of-order chunks', async t => {
++  const f = fixture(t, ({ ev, emit }) => {
++    ev.buffer();
++    emit([message('anchor', 1001)], { progress: 100, chunkOrder: 1 });
++    emit([message('middle', 1002)], { progress: 50, chunkOrder: 0 });
++    ev.emit('messaging-history.set', historyEvent('unrelated-session', [message('unrelated', 1000)], { progress: 100 }));
++    ev.flush();
++  });
++  assert.deepEqual(ids(await f.history.load(request())), ['anchor', 'middle']);
++  assert.equal(f.delivered.length, 1);
++  assert.equal(f.delivered[0].peerDataRequestSessionId, 'unrelated-session');
++  assert.deepEqual(ids(f.delivered[0].messages), ['anchor', 'middle', 'unrelated']);
++  assert.equal(f.ev.emit, f.originalEmit);
++});
++
++test('omitted protobuf fromMe is normalized on a copy without changing buffered messages', async t => {
++  const anchor = message('anchor', 1001);
++  delete anchor.key.fromMe;
++  const f = fixture(t, ({ ev, emit }) => {
++    ev.buffer();
++    emit([anchor], { progress: 100 });
++    ev.flush();
++  });
++  const result = await f.history.load({ ...request(), startFromMe: false });
++  assert.equal(result[0].key.fromMe, false);
++  assert.equal(f.delivered[0].messages[0].key.fromMe, null);
++  assert.notEqual(result[0], f.delivered[0].messages[0]);
++  assert.notEqual(result[0].key, f.delivered[0].messages[0].key);
++  assert.equal(result[0].messageTimestamp, f.delivered[0].messages[0].messageTimestamp);
++  await assert.rejects(f.history.load({ ...request(), startFromMe: true }), { code: 'HISTORY_UNAVAILABLE' });
++});
++
++test('nonboolean nonempty fromMe values remain invalid', async t => {
++  const f = fixture(t, ({ ev, session }) => {
++    const event = historyEvent(session, [message('anchor', 1001)], { progress: 100 });
++    event.messages[0].key.fromMe = 'false';
++    ev.emit('messaging-history.set', event);
++  });
++  await assert.rejects(f.history.load(request()), { code: 'HISTORY_UNAVAILABLE', message: /valid key/ });
++  assert.equal(f.ev.emit, f.originalEmit);
++});
++
++test('the scoped observer preserves emit receiver, arguments, return value, and unrelated events', async t => {
++  const f = fixture(t, ({ ev, emit }) => {
++    assert.equal(ev.emit('test.unrelated', marker, 'extra-argument'), true);
++    assert.equal(ev.emit('test.without-listener', marker), true);
++    ev.buffer();
++    emit([message('anchor', 1001)]); // Actual protobuf missing progress is null.
++    ev.flush();
++  });
++  const marker = { unchanged: true };
++  const seen = [];
++  const invocations = [];
++  f.ev.on('test.unrelated', value => seen.push(value));
++  const delegate = f.ev.emit;
++  const original = function (...args) {
++    invocations.push({ receiver: this, args });
++    return Reflect.apply(delegate, this, args);
++  };
++  f.ev.emit = original;
++  assert.deepEqual(ids(await f.history.load(request())), ['anchor']);
++  assert.deepEqual(seen, [marker]);
++  assert.deepEqual(invocations[0], { receiver: f.ev, args: ['test.unrelated', marker, 'extra-argument'] });
++  assert.equal(f.ev.emit, original);
++  assert.equal(f.delivered[0].progress, null);
++});
++
++test('the original emitter is restored after timeout, rejected fetch, malformed history, disconnect and close', async t => {
++  const cases = {
++    timeout: () => {},
++    'rejected fetch': () => { throw new Error('Fetch failed'); },
++    'malformed history': ({ ev, session }) => ev.emit('messaging-history.set', {
++      syncType: 6, peerDataRequestSessionId: session, messages: [], progress: 101,
++      chats: [], contacts: [],
++    }),
++    disconnect: ({ ev }) => ev.emit('connection.update', { connection: 'close' }),
++    close: () => {},
++  };
++  for (const [name, handler] of Object.entries(cases)) {
++    await t.test(name, async subtest => {
++      const f = fixture(subtest, handler, { timeoutMs: 25 });
++      const pending = f.history.load(request());
++      if (name === 'close') f.history.close();
++      await assert.rejects(pending);
++      assert.equal(f.ev.emit, f.originalEmit);
++    });
++  }
++});
++
++test('emit-less adapters retain listener-based history support and cleanup', async () => {
++  const source = new EventEmitter();
++  const ev = { on: source.on.bind(source), off: source.off.bind(source) };
++  const socket = {
++    ev,
++    async fetchMessageHistory() {
++      source.emit('messaging-history.set', historyEvent('request', [message('anchor', 1001)]));
++      return 'request';
++    },
++  };
++  const history = createOnDemandHistory({ getSocket: () => socket, settleMs: 1, timeoutMs: 100 });
++  try {
++    assert.deepEqual(ids(await history.load(request())), ['anchor']);
++    assert.equal(source.listenerCount('messaging-history.set'), 0);
++    assert.equal(source.listenerCount('connection.update'), 0);
++    assert.equal(ev.emit, undefined);
++  } finally {
++    history.close();
++  }
++});
+diff --git a/test/history-alias.test.js b/test/history-alias.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/history-alias.test.js
+@@ -0,0 +1,136 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { makeEventBuffer, processHistoryMessage, proto } from '@whiskeysockets/baileys';
++import { createOnDemandHistory } from '../src/history.js';
++
++const GROUP = '123@g.us';
++const PN = '456@s.whatsapp.net';
++const LID = '789@lid';
++const row = (id, participant = PN, timestamp = 1000, fromMe = false) => ({
++  key: { remoteJid: GROUP, id, participant, fromMe },
++  messageTimestamp: timestamp, message: { conversation: id },
++});
++const request = overrides => ({
++  groupId: GROUP, startId: 'anchor', startParticipant: LID, startFromMe: false,
++  endKey: row('command').key, endTimestamp: 1000, ...overrides,
++});
++
++function fixture(t, rows, mapping, options = {}) {
++  const ev = makeEventBuffer({ debug() {}, trace() {}, warn() {} });
++  const originalEmit = ev.emit;
++  let calls = 0;
++  const socket = {
++    ev, signalRepository: { lidMapping: mapping },
++    async fetchMessageHistory() {
++      const session = `request-${++calls}`;
++      const decoded = proto.HistorySync.decode(proto.HistorySync.encode({
++        syncType: 6, progress: 100,
++        conversations: [{ id: GROUP, messages: (calls === 1 ? rows : []).map(message => ({ message })) }],
++      }).finish());
++      ev.buffer();
++      ev.emit('messaging-history.set', { ...processHistoryMessage(decoded), peerDataRequestSessionId: session });
++      ev.flush();
++      return session;
++    },
++  };
++  const history = createOnDemandHistory({ getSocket: () => socket, timeoutMs: 200, settleMs: 1, ...options });
++  t.after(() => { history.close(); ev.destroy(); });
++  return { history, ev, originalEmit };
++}
++
++test('a LID quote matches a PN history anchor only through the verified mapping', async t => {
++  const lookups = [];
++  const f = fixture(t, [row('middle', '111@s.whatsapp.net'), row('anchor')], {
++    async getPNForLID(value) { lookups.push(value); return '456:3@s.whatsapp.net'; },
++    async getLIDForPN() { assert.fail('Unexpected lookup direction'); },
++  });
++  const result = await f.history.load(request());
++  assert.deepEqual(result.map(message => message.key.id), ['anchor', 'middle']);
++  assert.deepEqual(lookups, [LID]);
++  assert.equal(result[0].key.participantAlt, undefined);
++  assert.equal(f.ev.emit, f.originalEmit);
++});
++
++test('a PN quote matches a LID history anchor through the reverse verified mapping', async t => {
++  const lookups = [];
++  const f = fixture(t, [row('anchor', LID)], {
++    async getLIDForPN(value) { lookups.push(value); return LID; },
++  });
++  assert.equal((await f.history.load(request({ startParticipant: PN })))[0].key.participant, LID);
++  assert.deepEqual(lookups, [PN]);
++});
++
++test('a verified cursor alias excludes the command and later messages in the same second', async t => {
++  const lookups = [];
++  const f = fixture(t, [row('later'), row('command'), row('middle'), row('anchor')], {
++    async getPNForLID(value) { lookups.push(value); return PN; },
++  });
++  const result = await f.history.load(request({ endKey: row('command', LID).key }));
++  assert.deepEqual(result.map(message => message.key.id), ['anchor', 'middle']);
++  assert.deepEqual(lookups, [LID, LID]);
++});
++
++test('an unverified cursor sender fails instead of including later messages in the same second', async t => {
++  const f = fixture(t, [row('later'), row('command'), row('anchor')], {
++    async getPNForLID() { return null; },
++  });
++  await assert.rejects(f.history.load(request({ endKey: row('command', LID).key })), {
++    code: 'HISTORY_UNAVAILABLE', message: /history boundary whose sender could not be verified/,
++  });
++  assert.equal(f.ev.emit, f.originalEmit);
++});
++
++test('direct participant matches do not perform identity lookups', async t => {
++  const f = fixture(t, [row('anchor')], {
++    async getPNForLID() { assert.fail('Unexpected lookup'); },
++    async getLIDForPN() { assert.fail('Unexpected lookup'); },
++  });
++  assert.equal((await f.history.load(request({ startParticipant: PN }))).length, 1);
++});
++
++test('missing, failed and mismatched mappings cannot authorize a different anchor sender', async t => {
++  for (const [name, lookup] of Object.entries({
++    absent: undefined,
++    missing: async () => null,
++    mismatch: async () => '999@s.whatsapp.net',
++    failure: async () => { throw new Error('Mapping unavailable'); },
++  })) {
++    await t.test(name, async subtest => {
++      const f = fixture(subtest, [row('anchor')], { getPNForLID: lookup });
++      await assert.rejects(f.history.load(request()), { code: 'HISTORY_UNAVAILABLE', message: /starting message but its sender could not be verified/ });
++      assert.equal(f.ev.emit, f.originalEmit);
++    });
++  }
++});
++
++test('aliases cannot override a required fromMe value', async t => {
++  for (const startFromMe of [true, false]) {
++    await t.test(String(startFromMe), async subtest => {
++      const f = fixture(subtest, [row('anchor', PN, 1000, !startFromMe)], {
++        async getPNForLID() { assert.fail('Sender direction must be checked before lookup'); },
++      });
++      await assert.rejects(f.history.load(request({ startFromMe })), { code: 'HISTORY_UNAVAILABLE' });
++    });
++  }
++});
++
++test('a hung alias lookup is bounded by the history deadline and releases the observer', async t => {
++  const f = fixture(t, [row('anchor')], {
++    getPNForLID() { return new Promise(() => {}); },
++  }, { timeoutMs: 25 });
++  await assert.rejects(f.history.load(request()), { code: 'HISTORY_UNAVAILABLE', message: /did not finish/ });
++  assert.equal(f.ev.emit, f.originalEmit);
++});
++
++test('closing during an alias lookup releases the observer immediately', async t => {
++  let entered;
++  const started = new Promise(resolve => { entered = resolve; });
++  const f = fixture(t, [row('anchor')], {
++    getPNForLID() { entered(); return new Promise(() => {}); },
++  });
++  const pending = f.history.load(request());
++  await started;
++  f.history.close();
++  await assert.rejects(pending, { code: 'HISTORY_UNAVAILABLE', message: /closed/ });
++  assert.equal(f.ev.emit, f.originalEmit);
++});
+diff --git a/test/history.test.js b/test/history.test.js
+--- a/test/history.test.js
++++ b/test/history.test.js
+@@ -242,7 +242,7 @@
+ test('rejects oversized command-scoped buffers and malformed matching response data', async () => {
+   for (const rows of [
+     null,
+-    [{ key: { remoteJid: GROUP, id: 'anchor' }, messageTimestamp: 999 }],
++    [{ key: { remoteJid: GROUP, id: 'anchor', fromMe: 'false' }, messageTimestamp: 999 }],
+     [{ ...message('anchor'), message: { conversation: 'x'.repeat(9 * 1024 * 1024) } }],
+     Array.from({ length: 102 }, (_, index) => message(index)),
+   ]) {
+diff --git a/test/bot.test.js b/test/bot.test.js
+--- a/test/bot.test.js
++++ b/test/bot.test.js
+@@ -1,6 +1,7 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+ import { createWhatsAppBot } from '../src/bot.js';
++import { HistoryUnavailableError } from '../src/history-error.js';
+ 
+ const GROUP = '123456-789@g.us';
+ const OTHER_GROUP = '987654-321@g.us';
+@@ -209,6 +210,18 @@
+   assert.match(f.calls.sends[0].content.text, /could not retrieve.*requested range/);
+   assert.match(f.calls.sends[0].content.text, /phone online/);
+   assert.doesNotMatch(f.calls.sends[0].content.text, /private request|token|phone number/);
++  assert.deepEqual(f.calls.errors, ['History retrieval failed: WhatsApp history is unavailable.']);
++});
++
++test('reports the specific application-authored history failure in chat and owner logs', async t => {
++  const guidance = 'WhatsApp disconnected while loading history. Please try again after it reconnects.';
++  const f = fixture(t, {
++    load: async () => { throw new HistoryUnavailableError(guidance); },
++  });
++  assert.deepEqual(await f.bot.handleMessages([command()]), ['failed']);
++  assert.equal(f.calls.inputs.length, 0);
++  assert.equal(f.calls.sends[0].content.text, guidance);
++  assert.deepEqual(f.calls.errors, [`History retrieval failed: ${guidance}`]);
+ });
+ 
+ test('an unavailable anchor never calls AI even when newer text was returned', async t => {
+diff --git a/test/service.test.js b/test/service.test.js
+--- a/test/service.test.js
++++ b/test/service.test.js
+@@ -1,6 +1,7 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+ import { createSummaryService, isSummariseCommand } from '../src/service.js';
++import { HistoryUnavailableError } from '../src/history-error.js';
+ 
+ function row(id, extra = {}) {
+   return {
+@@ -32,6 +33,7 @@
+     reply: async (groupId, id, text) => { replies.push({ groupId, id, text }); },
+     now: () => clock,
+     cooldownMs: options.cooldownMs ?? 30_000,
++    onError: options.onError,
+   });
+   return {
+     handle, anchor, command, rows, replies, inputs, loads,
+@@ -236,6 +238,17 @@
+   assert.doesNotMatch(history.replies[0].text + input.replies[0].text, /sensitive/);
+ });
+ 
++test('a diagnostic callback failure does not hide the history recovery guidance', async () => {
++  const guidance = 'WhatsApp returned history in an unexpected order. Please try again with a more recent starting message.';
++  const f = fixture({
++    loadMessages: async () => { throw new HistoryUnavailableError(guidance); },
++    onError: () => { throw new Error('logging failed'); },
++  });
++  assert.equal(await f.request(), 'failed');
++  assert.equal(f.replies[0].text, guidance);
++  assert.equal(f.inputs.length, 0);
++});
++
+ test('deduplicates replayed command IDs in memory and expires them after one hour', async () => {
+   const f = fixture();
+   const request = { command: f.command };

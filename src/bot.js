@@ -13,13 +13,15 @@ export function createWhatsAppBot({
   summarize,
   getSocket,
   getOwnIds,
-  history = createOnDemandHistory({
-    getSocket, maxMessages: config.maxMessages, timeoutMs: config.historyTimeoutMs,
-  }),
+  history,
   onPause = () => {},
   onError = () => {},
   now = Date.now,
 }) {
+  history ??= createOnDemandHistory({
+    getSocket, maxMessages: config.maxMessages, timeoutMs: config.historyTimeoutMs,
+    onDiagnostic: diagnostic => onError(`History diagnostic: ${JSON.stringify(diagnostic)}`),
+  });
   const activeCommands = new Map();
   // Only the bot's own recent replies, for Baileys delivery retries.
   const outgoing = new Map();

@@ -276,6 +276,12 @@ WhatsApp connectivity, account eligibility, history availability, or real infere
   The bot reports its specific history failure in the group and in the server log
   as `History retrieval failed: ...`. On the Google VM, inspect recent failures
   with `sudo journalctl -u whatsapp-summary-bot.service --since '10 minutes ago' --no-pager`.
+  Empty responses, pages that make no progress, and the configured message cap
+  have distinct recovery messages. These failures also log `History diagnostic:`
+  with the reason, page/message counts, cursor and anchor positions, and timestamp
+  direction counts. Diagnostics contain no message text, message IDs, phone numbers,
+  group identifiers, or absolute timestamps. To inspect only these diagnostics,
+  run `sudo journalctl -u whatsapp-summary-bot.service --since '10 minutes ago' --no-pager -o cat | grep -F 'History diagnostic:'`.
   If fresh messages also fail while WhatsApp is open on the bot phone, use this
   specific failure to diagnose the request; changing the AI model will not fix
   history retrieval. The pinned Baileys version filters previously returned

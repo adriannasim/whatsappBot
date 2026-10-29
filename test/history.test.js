@@ -116,12 +116,17 @@ test('missing progress uses a quiet interval and extends it when another chunk a
 });
 
 test('caps the requested range and fails instead of silently truncating it', async () => {
+  const diagnostics = [];
   const { history, calls, ev } = setup(({ session, emit, calls }) => {
     emit(session, calls.length === 1 ? [message('one'), message('two')] : [message('three')]);
-  }, { maxMessages: 3 });
+  }, { maxMessages: 3, onDiagnostic: value => diagnostics.push(value) });
   await assert.rejects(history.load(request()), { code: 'HISTORY_UNAVAILABLE', message: /starting message/ });
   assert.deepEqual(calls.map((call) => call.count), [3, 1]);
   assert.deepEqual(calls.map((call) => call.key.id), ['command', 'two']);
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0].reason, 'limit_reached');
+  assert.equal(diagnostics[0].pages, 2);
+  assert.equal(diagnostics[0].retained, 3);
   assertClean(ev);
 });
 
@@ -133,13 +138,49 @@ test('accepts an anchor exactly at the configured range cap', async () => {
 
 test('stops when a page cannot move the cursor or history is empty', async () => {
   for (const empty of [false, true]) {
+    const diagnostics = [];
     const { history, calls, ev } = setup(({ session, emit, calls }) => {
       emit(session, calls.length === 1 ? [message('recent')] : (empty ? [] : [message('recent')]));
-    });
+    }, { onDiagnostic: value => diagnostics.push(value) });
     await assert.rejects(history.load(request()), { code: 'HISTORY_UNAVAILABLE' });
     assert.equal(calls.length, 2);
+    assert.equal(diagnostics.length, 1);
+    assert.equal(diagnostics[0].reason, empty ? 'empty_page' : 'no_progress');
+    assert.equal(diagnostics[0].pages, 2);
+    assert.equal(diagnostics[0].pageRows, empty ? 0 : 1);
+    assert.equal(diagnostics[0].retained, 1);
     assertClean(ev);
   }
+});
+
+test('reports an excluded anchor and page direction without exposing message data', async () => {
+  const diagnostics = [];
+  const rows = [message('private-anchor-id', 998), message('private-middle-id', 999), message('command', 1000)];
+  const { history, calls, ev } = setup(({ session, emit }) => emit(session, rows), {
+    onDiagnostic: value => diagnostics.push(value),
+  });
+  await assert.rejects(history.load(request({ startId: 'private-anchor-id' })), {
+    code: 'HISTORY_UNAVAILABLE', message: /did not move back/,
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(diagnostics, [{
+    reason: 'no_progress', pages: 1, requested: 100, chunks: 1, pageRows: 3,
+    cursorIndex: 2, anchorIndex: 0, candidateRows: 0,
+    ascending: 2, descending: 0, equal: 0, retained: 0,
+  }]);
+  assert.ok(Object.isFrozen(diagnostics[0]));
+  assert.doesNotMatch(JSON.stringify(diagnostics), /private-|friends|whatsapp|Message|998|999|1000/);
+  assertClean(ev);
+});
+
+test('an empty response produces empty-page guidance even if diagnostics throw', async () => {
+  let attempted = 0;
+  const { history, ev } = setup(({ session, emit }) => emit(session, []), {
+    onDiagnostic: () => { attempted++; throw new Error('private diagnostic failure'); },
+  });
+  await assert.rejects(history.load(request()), { code: 'HISTORY_UNAVAILABLE', message: /no earlier messages/ });
+  assert.equal(attempted, 1);
+  assertClean(ev);
 });
 
 test('rejects future, reversed and malformed timestamps rather than manufacturing order', async () => {
@@ -270,7 +311,7 @@ test('validates configuration and requires actual command boundaries', async () 
   for (const maxMessages of [0, -1, 1.5, Infinity, '100']) {
     assert.throws(() => createOnDemandHistory({ getSocket: () => ({}), maxMessages }), /maxMessages/);
   }
-  for (const [name, value] of [['timeoutMs', 0], ['settleMs', -1], ['onDemandType', -1]]) {
+  for (const [name, value] of [['timeoutMs', 0], ['settleMs', -1], ['onDemandType', -1], ['onDiagnostic', null]]) {
     assert.throws(() => createOnDemandHistory({ getSocket: () => ({}), [name]: value }), new RegExp(name));
   }
   const { history, calls } = setup(() => {});

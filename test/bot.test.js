@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { createWhatsAppBot } from '../src/bot.js';
 import { HistoryUnavailableError } from '../src/history-error.js';
 
@@ -223,6 +224,53 @@ test('reports the specific application-authored history failure in chat and owne
   assert.equal(f.calls.sends[0].content.text, guidance);
   assert.deepEqual(f.calls.errors, [`History retrieval failed: ${guidance}`]);
 });
+
+for (const loggingThrows of [false, true]) {
+  test(`default history reports an empty page and preserves recovery when logging ${loggingThrows ? 'throws' : 'succeeds'}`, async t => {
+    const errors = [];
+    const replies = [];
+    let summaries = 0;
+    const ev = new EventEmitter();
+    const socket = {
+      ev,
+      async fetchMessageHistory() {
+        ev.emit('messaging-history.set', {
+          syncType: 6, peerDataRequestSessionId: 'history-request', messages: [], progress: 100,
+        });
+        return 'history-request';
+      },
+      async sendMessage(groupId, content) {
+        replies.push(content.text);
+        return { key: { remoteJid: groupId, id: 'recovery-reply' }, message: { conversation: content.text } };
+      },
+    };
+    const bot = createWhatsAppBot({
+      config: { groupIds: new Set([GROUP]), maxMessages: 3000, historyTimeoutMs: 2000 },
+      getSocket: () => socket,
+      getOwnIds: () => OWN_IDS,
+      summarize: async () => { summaries++; return 'Unexpected summary'; },
+      onError: error => {
+        errors.push(error);
+        if (loggingThrows) throw new Error('Logging is unavailable');
+      },
+    });
+    t.after(() => bot.close());
+
+    assert.deepEqual(await bot.handleMessages([command()]), ['failed']);
+    const diagnostics = errors.filter(error => error.startsWith('History diagnostic: '));
+    assert.equal(diagnostics.length, 1);
+    const diagnostic = JSON.parse(diagnostics[0].slice('History diagnostic: '.length));
+    assert.equal(diagnostic.reason, 'empty_page');
+    assert.equal(diagnostic.pages, 1);
+    assert.equal(diagnostic.pageRows, 0);
+    assert.equal(summaries, 0);
+    assert.deepEqual(replies, ['WhatsApp returned no earlier messages before reaching the starting message. Please try again with a new !summarise reply.']);
+    assert.equal(errors.length, 2);
+    assert.equal(errors[1], `History retrieval failed: ${replies[0]}`);
+    assert.equal(ev.listenerCount('connection.update'), 0);
+    assert.equal(ev.listenerCount('messaging-history.set'), 0);
+  });
+}
 
 test('an unavailable anchor never calls AI even when newer text was returned', async t => {
   const f = fixture(t, { rows: [message('newer')] });

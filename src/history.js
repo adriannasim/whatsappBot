@@ -66,8 +66,10 @@ export function createOnDemandHistory({
   timeoutMs = 30000,
   settleMs = 750,
   onDemandType = 6, // proto.HistorySync.HistorySyncType.ON_DEMAND
+  onDiagnostic = () => {},
 } = {}) {
   if (typeof getSocket !== 'function') throw new TypeError('getSocket must be a function');
+  if (typeof onDiagnostic !== 'function') throw new TypeError('onDiagnostic must be a function');
   if (!Number.isSafeInteger(maxMessages) || maxMessages < 1) throw new TypeError('maxMessages must be a positive integer');
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new TypeError('timeoutMs must be a positive integer');
   if (!Number.isSafeInteger(settleMs) || settleMs < 0) throw new TypeError('settleMs must be a non-negative integer');
@@ -88,6 +90,17 @@ export function createOnDemandHistory({
     let page;
     let deadline;
     let abort;
+    let pages = 0;
+    let pageStats;
+
+    function missingAnchor(reason, message) {
+      // Only bounded counts and positions from this command. Never include
+      // message contents, IDs, participant/group JIDs, or absolute timestamps.
+      try {
+        onDiagnostic(Object.freeze({ reason, pages, ...pageStats, retained: reverseMessages.length }));
+      } catch { /* Diagnostics must not prevent the normal recovery reply. */ }
+      return unavailable(message);
+    }
 
     const failure = new Promise((_, reject) => {
       abort = () => reject(controller.signal.reason);
@@ -225,6 +238,7 @@ export function createOnDemandHistory({
         completed.catch(() => {});
         page = { id: undefined, chunks: [], early: [], earlyBytes: 0, bytes: 0, count: 0, resolve: resolvePage, reject: rejectPage };
         const count = Math.min(100, maxMessages - reverseMessages.length);
+        pages++;
         const session = await Promise.race([
           Promise.resolve().then(() => {
             if (controller.signal.aborted) throw controller.signal.reason;
@@ -249,6 +263,15 @@ export function createOnDemandHistory({
           chunks.sort((a, b) => a.order - b.order || a.received - b.received);
         }
         let rows = chunks.flatMap((chunk) => chunk.rows);
+        pageStats = {
+          requested: count, chunks: chunks.length, pageRows: rows.length,
+          cursorIndex: -1, anchorIndex: rows.findIndex(message => message.key.id === request.startId),
+          candidateRows: rows.length, ascending: 0, descending: 0, equal: 0,
+        };
+        for (let index = 1; index < rows.length; index++) {
+          const difference = timestampSeconds(rows[index].messageTimestamp) - timestampSeconds(rows[index - 1].messageTimestamp);
+          pageStats[difference > 0 ? 'ascending' : difference < 0 ? 'descending' : 'equal']++;
+        }
         let cursorIndex = -1;
         let cursorIdPresent = false;
         for (let index = 0; index < rows.length; index++) {
@@ -265,6 +288,8 @@ export function createOnDemandHistory({
           throw unavailable('WhatsApp returned a history boundary whose sender could not be verified. Please try again with a new !summarise command.');
         }
         if (cursorIndex !== -1) rows = rows.slice(cursorIndex + 1);
+        pageStats.cursorIndex = cursorIndex;
+        pageStats.candidateRows = rows.length;
 
         let oldest;
         let previousTimestamp = cursorTimestamp;
@@ -289,12 +314,17 @@ export function createOnDemandHistory({
           }
           if (reverseMessages.length >= maxMessages) break;
         }
-        if (!oldest) break;
+        if (!oldest) {
+          throw missingAnchor(pageStats.pageRows === 0 ? 'empty_page' : 'no_progress',
+            pageStats.pageRows === 0
+              ? 'WhatsApp returned no earlier messages before reaching the starting message. Please try again with a new !summarise reply.'
+              : 'WhatsApp returned history that did not move back to the starting message. Please try again with a new !summarise reply.');
+        }
         cursorKey = { ...oldest.key };
         cursorTimestamp = timestampSeconds(oldest.messageTimestamp);
         page = undefined;
       }
-      throw unavailable('I could not load the starting message within the available history limit. Keep the bot account\'s phone online, or reply to a more recent message.');
+      throw missingAnchor('limit_reached', 'I could not load the starting message within the configured history limit. Please reply to a more recent message.');
     } finally {
       clearTimeout(deadline);
       clearTimeout(page?.settleTimer);

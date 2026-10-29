@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSummaryService, isSummariseCommand } from '../src/service.js';
+import { HistoryUnavailableError } from '../src/history-error.js';
 
 function row(id, extra = {}) {
   return {
@@ -32,6 +33,7 @@ function fixture(options = {}) {
     reply: async (groupId, id, text) => { replies.push({ groupId, id, text }); },
     now: () => clock,
     cooldownMs: options.cooldownMs ?? 30_000,
+    onError: options.onError,
   });
   return {
     handle, anchor, command, rows, replies, inputs, loads,
@@ -234,6 +236,17 @@ test('history and input-size errors give guidance without exposing provider deta
   assert.equal(await input.request(), 'failed');
   assert.match(input.replies[0].text, /too long/);
   assert.doesNotMatch(history.replies[0].text + input.replies[0].text, /sensitive/);
+});
+
+test('a diagnostic callback failure does not hide the history recovery guidance', async () => {
+  const guidance = 'WhatsApp returned history in an unexpected order. Please try again with a more recent starting message.';
+  const f = fixture({
+    loadMessages: async () => { throw new HistoryUnavailableError(guidance); },
+    onError: () => { throw new Error('logging failed'); },
+  });
+  assert.equal(await f.request(), 'failed');
+  assert.equal(f.replies[0].text, guidance);
+  assert.equal(f.inputs.length, 0);
 });
 
 test('deduplicates replayed command IDs in memory and expires them after one hour', async () => {

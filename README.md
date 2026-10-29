@@ -273,6 +273,16 @@ WhatsApp connectivity, account eligibility, history availability, or real infere
 - **History unavailable or timed out:** keep the bot phone online, try a recent
   starting message visible on it, and send a new command. Increasing
   `HISTORY_TIMEOUT_MS` may help a slow response but cannot restore missing history.
+  The bot reports its specific history failure in the group and in the server log
+  as `History retrieval failed: ...`. On the Google VM, inspect recent failures
+  with `sudo journalctl -u whatsapp-summary-bot.service --since '10 minutes ago' --no-pager`.
+  If fresh messages also fail while WhatsApp is open on the bot phone, use this
+  specific failure to diagnose the request; changing the AI model will not fix
+  history retrieval. The pinned Baileys version filters previously returned
+  history in its event buffer, so this bot observes on-demand responses before
+  that buffering, only for the duration of a summary request. Incoming history
+  accepts WhatsApp's omitted `fromMe` flag as false, and checks alternate sender
+  identifiers against Baileys' verified phone-number/LID mappings.
 - **QR needed after upgrading:** the old whatsapp-web.js session is incompatible;
   link Baileys as a new device with `npm run groups`.
 - **ChatGPT sign-in required:** stop the bot and run `npm run login`; use

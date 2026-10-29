@@ -1,3 +1,5 @@
+import { HistoryUnavailableError } from './history-error.js';
+
 const MAX_REPLY_LENGTH = 3500;
 const COMMAND_TTL_MS = 60 * 60 * 1000;
 const MAX_REMEMBERED_COMMANDS = 1000;
@@ -38,6 +40,7 @@ export function createSummaryService({
   summarize,
   reply,
   onPause = () => {},
+  onError = () => {},
   now = () => Date.now(),
   cooldownMs = 30_000,
 }) {
@@ -128,6 +131,13 @@ export function createSummaryService({
       lastSuccess.set(groupId, now());
       return 'summarised';
     } catch (error) {
+      if (error?.code === 'HISTORY_UNAVAILABLE') {
+        // Only our fixed recovery guidance is safe to log or send to the group.
+        const detail = error instanceof HistoryUnavailableError
+          ? error.message : 'WhatsApp history is unavailable.';
+        try { onError(`History retrieval failed: ${detail}`); }
+        catch { /* Diagnostics must not prevent the recovery reply. */ }
+      }
       if (error?.code === 'PLAN_LIMIT') {
         planPaused = true;
         try { onPause(); } catch { /* Logging must not prevent the user-facing reply. */ }
@@ -141,7 +151,8 @@ export function createSummaryService({
         SUBSCRIPTION_NOT_ENABLED: 'The bot owner needs to authorise ChatGPT plan usage before summaries can continue.',
         MODEL_UNAVAILABLE: 'The configured summary model is unavailable. The bot owner needs to choose another available model.',
       };
-      const message = planMessages[error?.code] || (error?.code === 'HISTORY_UNAVAILABLE'
+      const message = error instanceof HistoryUnavailableError ? error.message
+        : planMessages[error?.code] || (error?.code === 'HISTORY_UNAVAILABLE'
         ? 'I could not retrieve that starting message or the requested range from WhatsApp. Keep the bot phone online, then reply to a newer starting message and try !summarise again.'
         : error?.code === 'INPUT_TOO_LARGE'
           ? 'That conversation is too long for one summary. Reply to a newer starting message and send !summarise again.'

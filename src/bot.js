@@ -33,7 +33,7 @@ export function createWhatsAppBot({
   expiryTimer.unref?.();
 
   const handle = createSummaryService({
-    summarize, onPause, now,
+    summarize, onPause, onError, now,
     loadMessages: async ({ groupId, startId, endId }) => {
       const context = activeCommands.get(keyFor(groupId, endId));
       if (closed || !context || context.socket !== getSocket()) throw new Error('Connection changed');

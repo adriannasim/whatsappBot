@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createWhatsAppBot } from '../src/bot.js';
+import { HistoryUnavailableError } from '../src/history-error.js';
 
 const GROUP = '123456-789@g.us';
 const OTHER_GROUP = '987654-321@g.us';
@@ -209,6 +210,18 @@ test('a failed history request gives recovery guidance without inferring a summa
   assert.match(f.calls.sends[0].content.text, /could not retrieve.*requested range/);
   assert.match(f.calls.sends[0].content.text, /phone online/);
   assert.doesNotMatch(f.calls.sends[0].content.text, /private request|token|phone number/);
+  assert.deepEqual(f.calls.errors, ['History retrieval failed: WhatsApp history is unavailable.']);
+});
+
+test('reports the specific application-authored history failure in chat and owner logs', async t => {
+  const guidance = 'WhatsApp disconnected while loading history. Please try again after it reconnects.';
+  const f = fixture(t, {
+    load: async () => { throw new HistoryUnavailableError(guidance); },
+  });
+  assert.deepEqual(await f.bot.handleMessages([command()]), ['failed']);
+  assert.equal(f.calls.inputs.length, 0);
+  assert.equal(f.calls.sends[0].content.text, guidance);
+  assert.deepEqual(f.calls.errors, [`History retrieval failed: ${guidance}`]);
 });
 
 test('an unavailable anchor never calls AI even when newer text was returned', async t => {

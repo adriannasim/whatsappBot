@@ -242,7 +242,7 @@ test('closing immediately prevents the scheduled fetch from being sent', async (
 test('rejects oversized command-scoped buffers and malformed matching response data', async () => {
   for (const rows of [
     null,
-    [{ key: { remoteJid: GROUP, id: 'anchor' }, messageTimestamp: 999 }],
+    [{ key: { remoteJid: GROUP, id: 'anchor', fromMe: 'false' }, messageTimestamp: 999 }],
     [{ ...message('anchor'), message: { conversation: 'x'.repeat(9 * 1024 * 1024) } }],
     Array.from({ length: 102 }, (_, index) => message(index)),
   ]) {

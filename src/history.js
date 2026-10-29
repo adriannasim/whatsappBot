@@ -1,12 +1,12 @@
+import { HistoryUnavailableError } from './history-error.js';
+
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_EARLY_EVENTS = 32;
 const MAX_CHUNKS_PER_PAGE = 128;
 const MAX_QUEUED_REQUESTS = 20;
 
 function unavailable(message) {
-  const error = new Error(message);
-  error.code = 'HISTORY_UNAVAILABLE';
-  return error;
+  return new HistoryUnavailableError(message);
 }
 
 function timestampSeconds(value) {
@@ -97,6 +97,24 @@ export function createOnDemandHistory({
     // Attach immediately: socket events can arrive before a page starts awaiting it.
     failure.catch(() => {});
 
+    async function matchesVerifiedParticipant(key, participant) {
+      if (matchesParticipant(key, participant)) return true;
+      const mapping = socket.signalRepository?.lidMapping;
+      const wanted = normalizeParticipant(participant);
+      const lookup = /@(lid|hosted\.lid)$/.test(wanted) ? mapping?.getPNForLID
+        : /@(s\.whatsapp\.net|hosted)$/.test(wanted) ? mapping?.getLIDForPN : undefined;
+      if (typeof lookup !== 'function') return false;
+      // History protobufs do not carry participantAlt. Baileys stores verified
+      // PN/LID mappings before emitting history, so resolve only a matching
+      // message ID, after its response arrived. Never equate unrelated users
+      // merely because their message IDs or timestamp happen to match.
+      const alias = await Promise.race([
+        Promise.resolve().then(() => lookup.call(mapping, wanted)).catch(() => undefined),
+        failure,
+      ]);
+      return typeof alias === 'string' && Boolean(alias) && matchesParticipant(key, alias);
+    }
+
     function finishPageSoon() {
       clearTimeout(page?.settleTimer);
       if (!page || (page.progress !== undefined && page.progress < 100)) return;
@@ -108,11 +126,16 @@ export function createOnDemandHistory({
       try {
         if (!Array.isArray(event.messages)) throw unavailable('WhatsApp returned malformed history. Please try again.');
         const rows = [];
-        for (const message of event.messages) {
+        for (let message of event.messages) {
           if (message?.key?.remoteJid !== request.groupId) continue;
-          if (typeof message.key.id !== 'string' || !message.key.id || typeof message.key.fromMe !== 'boolean') {
+          if (typeof message.key.id !== 'string' || !message.key.id
+            || (message.key.fromMe != null && typeof message.key.fromMe !== 'boolean')) {
             throw unavailable('WhatsApp returned a message without a valid key. Please try again.');
           }
+          // Protobuf optional false values may be absent (decoded as null).
+          // Baileys treats these as incoming messages. Copy rather than mutate
+          // the raw message shared with its event buffer and other consumers.
+          if (message.key.fromMe == null) message = { ...message, key: { ...message.key, fromMe: false } };
           timestampSeconds(message.messageTimestamp);
           page.bytes += byteLength(message);
           if (++page.count > maxMessages + 100 || retainedBytes + page.bytes > MAX_BUFFER_BYTES) {
@@ -172,9 +195,27 @@ export function createOnDemandHistory({
       if (update?.connection === 'close') controller.abort(unavailable('WhatsApp disconnected while loading history. Please try again after it reconnects.'));
     }
 
-    socket.ev.on('messaging-history.set', onHistory);
-    socket.ev.on('connection.update', onConnection);
+    const originalEmit = socket.ev.emit;
+    let observingRawHistory = false;
+    function emitWithHistoryObserver(...args) {
+      if (args[0] === 'messaging-history.set') onHistory(args[1]);
+      return Reflect.apply(originalEmit, this, args);
+    }
     try {
+      if (typeof originalEmit === 'function') {
+        // Baileys buffers history events and deduplicates message IDs across
+        // requests. Observe each raw response before that buffer can drop an
+        // overlapping range or merge its session/chunk metadata. Keep the
+        // original emission intact for Baileys and other consumers, and do not
+        // also subscribe to the later buffered copy. This observer lives only
+        // for this command and retains no conversation between commands.
+        socket.ev.emit = emitWithHistoryObserver;
+        observingRawHistory = true;
+      } else {
+        // Compatibility with adapters that only expose subscription methods.
+        socket.ev.on('messaging-history.set', onHistory);
+      }
+      socket.ev.on('connection.update', onConnection);
       let cursorKey = request.endKey;
       let cursorTimestamp = request.endTimestamp;
       while (reverseMessages.length < maxMessages) {
@@ -208,7 +249,21 @@ export function createOnDemandHistory({
           chunks.sort((a, b) => a.order - b.order || a.received - b.received);
         }
         let rows = chunks.flatMap((chunk) => chunk.rows);
-        const cursorIndex = rows.findIndex((message) => message.key.id === cursorKey.id && matchesParticipant(message.key, cursorKey.participant));
+        let cursorIndex = -1;
+        let cursorIdPresent = false;
+        for (let index = 0; index < rows.length; index++) {
+          const key = rows[index].key;
+          if (key.id !== cursorKey.id) continue;
+          cursorIdPresent = true;
+          if (key.fromMe === cursorKey.fromMe
+            && await matchesVerifiedParticipant(key, cursorKey.participant)) {
+            cursorIndex = index;
+            break;
+          }
+        }
+        if (cursorIdPresent && cursorIndex === -1) {
+          throw unavailable('WhatsApp returned a history boundary whose sender could not be verified. Please try again with a new !summarise command.');
+        }
         if (cursorIndex !== -1) rows = rows.slice(cursorIndex + 1);
 
         let oldest;
@@ -224,11 +279,13 @@ export function createOnDemandHistory({
           reverseMessages.push(message);
           retainedBytes += byteLength(message);
           oldest = message;
-          const anchorSenderMatches = request.startFromMe === true
-            ? message.key.fromMe === true
-            : (request.startFromMe !== false || message.key.fromMe === false) && matchesParticipant(message.key, request.startParticipant);
-          if (message.key.id === request.startId && anchorSenderMatches) {
-            return Object.freeze(reverseMessages.slice().reverse());
+          if (message.key.id === request.startId) {
+            const anchorSenderMatches = request.startFromMe === true
+              ? message.key.fromMe === true
+              : (request.startFromMe !== false || message.key.fromMe === false)
+                && await matchesVerifiedParticipant(message.key, request.startParticipant);
+            if (anchorSenderMatches) return Object.freeze(reverseMessages.slice().reverse());
+            throw unavailable('WhatsApp returned the starting message but its sender could not be verified. Please try again with a new !summarise command.');
           }
           if (reverseMessages.length >= maxMessages) break;
         }
@@ -242,7 +299,11 @@ export function createOnDemandHistory({
       clearTimeout(deadline);
       clearTimeout(page?.settleTimer);
       controller.signal.removeEventListener('abort', abort);
-      socket.ev.off('messaging-history.set', onHistory);
+      if (observingRawHistory) {
+        if (socket.ev.emit === emitWithHistoryObserver) socket.ev.emit = originalEmit;
+      } else {
+        socket.ev.off('messaging-history.set', onHistory);
+      }
       socket.ev.off('connection.update', onConnection);
       page = undefined;
       reverseMessages.length = 0;

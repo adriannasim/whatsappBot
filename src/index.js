@@ -72,7 +72,7 @@ connection = createWhatsAppConnection({
     if (stopping) return;
     if (!listGroups) {
       bot?.onConnected();
-      console.log(`Ready in ${config.groupIds.size} selected group(s). Commands: !gm, !gn, and @mention !summarise replies.`);
+      console.log(`Ready in ${config.groupIds.size} selected group(s). Commands: !gm, !gn, !horny, and @mention !summarise replies.`);
       console.log('Private recent-message cache: up to 24 hours and 3000 messages per selected group. Saved messages survive restarts; missed-message recovery is best-effort.');
       return;
     }

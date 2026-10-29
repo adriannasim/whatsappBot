@@ -1,4 +1,5 @@
 import { randomInt } from 'node:crypto';
+import { FLIRTY_PHRASES } from './flirty-phrases.js';
 
 const phrases = {
   gm: [
@@ -26,17 +27,20 @@ const phrases = {
 /** Recognize complete greeting command tokens; conflicting commands are ignored. */
 export function getGreetingKind(text) {
   if (typeof text !== 'string') return null;
-  const morning = /(?:^|\s)!gm(?=\s|$)/i.test(text);
-  const night = /(?:^|\s)!gn(?=\s|$)/i.test(text);
-  return morning === night ? null : morning ? 'gm' : 'gn';
+  const kinds = new Set([...text.matchAll(/(?:^|\s)!(gm|gn|horny)(?=\s|$)/gi)].map(match => match[1].toLowerCase()));
+  return kinds.size === 1 ? [...kinds][0] : null;
 }
 
 /** senderJid must come from the message's verified participant metadata. */
 export function createGreeting(kind, senderJid) {
-  if (kind !== 'gm' && kind !== 'gn') throw new TypeError('Unknown greeting command.');
+  if (kind !== 'gm' && kind !== 'gn' && kind !== 'horny') throw new TypeError('Unknown greeting command.');
   const sender = typeof senderJid === 'string' && /^(\d+)@(s\.whatsapp\.net|lid)$/.exec(senderJid);
   if (!sender || sender[0] !== senderJid || senderJid.length > 256) {
     throw new TypeError('Greeting recipient must be a normalized participant JID.');
+  }
+  if (kind === 'horny') {
+    const phrase = FLIRTY_PHRASES[randomInt(FLIRTY_PHRASES.length)];
+    return { text: `Hey there, ${phrase.nickname} @${sender[1]}!\n\n${phrase.text}`, mentions: [senderJid] };
   }
   const greeting = kind === 'gm' ? 'Good morning' : 'Good night';
   const phrase = phrases[kind][randomInt(phrases[kind].length)];

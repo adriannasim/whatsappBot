@@ -9,7 +9,8 @@ const keyFor = (groupId, id) => JSON.stringify([groupId, id]);
 const RETRY_TTL_MS = 5 * 60 * 1000;
 const MAX_RETRY_MESSAGES = 50;
 const MAX_ACTIVE_COMMANDS = 64;
-const actionable = context => context && (context.kind === 'gm' || context.kind === 'gn' || context.mentioned);
+const greetingKinds = new Set(['gm', 'gn', 'horny']);
+const actionable = context => context && (greetingKinds.has(context.kind) || context.mentioned);
 
 /** Summarize bounded saved ranges, with best-effort phone recovery for gaps. */
 export function createWhatsAppBot({
@@ -186,7 +187,7 @@ export function createWhatsAppBot({
     if (!context.socket) return 'disconnected';
     activeCommands.set(key, context);
     try {
-      if (context.kind === 'gm' || context.kind === 'gn') {
+      if (greetingKinds.has(context.kind)) {
         const greeting = createGreeting(context.kind, context.senderJid);
         await reply(context.command.groupId, context.command.id, greeting.text, greeting.mentions);
         return 'greeted';

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeJid, sameUser, messageTimestamp, extractContent, getIncomingCommand, normalizeMessages } from '../src/adapter.js';
 import { createGreeting, getGreetingKind } from '../src/greetings.js';
+import { FLIRTY_PHRASES } from '../src/flirty-phrases.js';
 
 const group = '123456-789@g.us';
 const ownIds = ['999:4@s.whatsapp.net', '111:2@lid'];
@@ -142,13 +143,15 @@ test('recognizes standalone greeting tokens without matching prefixes or conflic
     assert.equal(getGreetingKind(text), 'gm');
   }
   for (const text of ['!gn', '\t!GN ', 'Time to rest !gn']) assert.equal(getGreetingKind(text), 'gn');
-  for (const text of [null, 1, '', 'gm', '!gmatch', '!gname', 'hello!gm', '!gm!', '!gn.', '!gm !gn', '!GN !GM']) {
+  for (const text of ['!horny', '  !HORNY\n', '!horny !horny']) assert.equal(getGreetingKind(text), 'horny');
+  for (const text of [null, 1, '', 'gm', '!gmatch', '!gname', 'hello!gm', '!gm!', '!gn.', '!gm !gn', '!GN !GM',
+    'horny', '!hornyness', 'hello!horny', '!horny!', '!horny !gm', '!gn !horny']) {
     assert.equal(getGreetingKind(text), null);
   }
 });
 
 test('greetings need no bot mention or quoted message and target the actual normalized sender', () => {
-  for (const kind of ['gm', 'gn']) {
+  for (const kind of ['gm', 'gn', 'horny']) {
     const parsed = getIncomingCommand(message(kind, { message: { conversation: `!${kind}` } }), ownIds);
     assert.equal(parsed.kind, kind);
     assert.equal(parsed.senderJid, '123@s.whatsapp.net');
@@ -226,12 +229,27 @@ test('greeting replies mention only the supplied verified sender and contain a s
   assert.throws(() => createGreeting('summarise', '123@lid'), /Unknown greeting/);
 });
 
-test('normalization marks morning and night greetings as commands for transcript filtering', () => {
+test('normalization marks greeting and flirty commands for transcript filtering', () => {
   const rows = normalizeMessages([
     message('gm', { message: { conversation: '!gm' } }),
     message('gn', { message: { conversation: 'Bye !GN' } }),
+    message('horny', { message: { conversation: '!HORNY' } }),
     message('ordinary'),
     message('false-prefix', { message: { conversation: '!gmatch' } }),
   ], group, { ownIds });
-  assert.deepEqual(rows.map(row => row.isCommand), [true, true, false, false]);
+  assert.deepEqual(rows.map(row => row.isCommand), [true, true, true, false, false]);
+});
+
+test('flirty replies draw from twenty distinct lines with emojis and mention only the sender', () => {
+  assert.equal(FLIRTY_PHRASES.length, 20);
+  assert.equal(new Set(FLIRTY_PHRASES.map(phrase => phrase.text)).size, 20);
+  for (const phrase of FLIRTY_PHRASES) {
+    assert.match(phrase.text, /\p{Extended_Pictographic}/u);
+    assert.doesNotMatch(phrase.nickname + phrase.text, /@/);
+  }
+  for (const jid of ['123@s.whatsapp.net', '456@lid']) {
+    const reply = createGreeting('horny', jid);
+    assert.deepEqual(reply.mentions, [jid]);
+    assert.ok(FLIRTY_PHRASES.some(phrase => reply.text === `Hey there, ${phrase.nickname} @${jid.split('@')[0]}!\n\n${phrase.text}`));
+  }
 });

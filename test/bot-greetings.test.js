@@ -58,7 +58,7 @@ test('other groups, own messages, old commands and offline replay do not trigger
   const own = message('self', '!gn', OWN);
   const old = { ...message('old', '!gm'), messageTimestamp: SECOND - 1 };
   assert.deepEqual(await f.bot.handleMessages([wrongGroup, own, old]), ['ignored', 'ignored', 'ignored']);
-  const replay = message('replay', '!gn');
+  const replay = message('replay', '!horny');
   f.bot.handleReplayMessages([replay]);
   assert.deepEqual(await f.bot.handleMessages([replay]), ['duplicate']);
   assert.deepEqual(f.calls.sends, []);
@@ -69,7 +69,7 @@ test('duplicate greetings are suppressed in the same batch, on redelivery and af
   let saved;
   const recentStore = { async save(value) { saved = structuredClone(value); }, async flush() {} };
   const f = fixture(t, { recentStore });
-  const greeting = message('greeting', '!gm');
+  const greeting = message('greeting', '!horny');
   assert.deepEqual(await f.bot.handleMessages([greeting, greeting]), ['greeted', 'duplicate']);
   assert.deepEqual(await f.bot.handleMessages([greeting]), ['duplicate']);
   assert.equal(f.calls.sends.length, 1);
@@ -87,9 +87,24 @@ test('greeting commands stay out of summaries and do not consume the summary coo
   summary.message = { extendedTextMessage: { text: '@Bot !summarise', contextInfo: {
     mentionedJid: [OWN], stanzaId: 'anchor', participant: '123@s.whatsapp.net',
   } } };
-  assert.deepEqual(await f.bot.handleMessages([anchor, message('gm', '!gm'), message('gn', '!gn'), summary]),
-    ['ignored', 'greeted', 'greeted', 'summarised']);
+  assert.deepEqual(await f.bot.handleMessages([anchor, message('gm', '!gm'), message('gn', '!gn'), message('flirt', '!horny'), summary]),
+    ['ignored', 'greeted', 'greeted', 'greeted', 'summarised']);
   assert.equal(f.calls.ai.length, 1);
   assert.deepEqual(f.calls.ai[0].map(row => row.id), ['anchor']);
   assert.equal(f.calls.history.length, 0);
+});
+
+test('the flirty command tags the sender even when someone else is mentioned in the input', async t => {
+  const f = fixture(t);
+  const raw = message('flirty', '', '456:8@lid');
+  raw.message = { extendedTextMessage: { text: '!HORNY @777', contextInfo: {
+    mentionedJid: ['777@s.whatsapp.net'], participant: '777@s.whatsapp.net',
+  } } };
+  assert.deepEqual(await f.bot.handleMessages([raw]), ['greeted']);
+  assert.deepEqual(f.calls.sends[0].content.mentions, ['456@lid']);
+  assert.match(f.calls.sends[0].content.text, /^Hey there, .+ @456!/);
+  assert.match(f.calls.sends[0].content.text, /\p{Extended_Pictographic}/u);
+  assert.doesNotMatch(f.calls.sends[0].content.text, /@777/);
+  assert.equal(f.calls.history.length, 0);
+  assert.equal(f.calls.ai.length, 0);
 });

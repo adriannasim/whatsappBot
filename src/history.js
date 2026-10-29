@@ -1,4 +1,5 @@
 import { HistoryUnavailableError } from './history-error.js';
+import { requestHistoryPage } from './history-request.js';
 import { normalizeMessageContent, proto } from '@whiskeysockets/baileys';
 
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
@@ -105,7 +106,7 @@ export function createOnDemandHistory({
       // Only bounded counts and positions from this command. Never include
       // message contents, IDs, participant/group JIDs, or absolute timestamps.
       try {
-        onDiagnostic(Object.freeze({ reason, pages, retries, ...pageStats, retained: reverseMessages.length }));
+        onDiagnostic(Object.freeze({ reason, pages, retries, privacySensitive: typeof socket.relayMessage === 'function', ...pageStats, retained: reverseMessages.length }));
       } catch { /* Diagnostics must not prevent the normal recovery reply. */ }
     }
 
@@ -351,7 +352,7 @@ export function createOnDemandHistory({
         const session = await Promise.race([
           Promise.resolve().then(() => {
             if (controller.signal.aborted) throw controller.signal.reason;
-            return socket.fetchMessageHistory(count, cursorKey, cursorTimestamp);
+            return requestHistoryPage(socket, count, cursorKey, cursorTimestamp);
           }),
           completed.then(() => { throw unavailable('WhatsApp returned history before its request was identified. Please try again.'); }),
           failure,

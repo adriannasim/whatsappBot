@@ -65,6 +65,27 @@ test('pages backwards using each oldest actual key and retains equal-second prot
   assertClean(ev);
 });
 
+test('a live relay socket uses the privacy-sensitive peer request and correlates its response', async () => {
+  const { history, socket, emit, calls, ev } = setup(() => {
+    throw new Error('The legacy fetch must not send the live request');
+  });
+  socket.user = { id: '123:7@s.whatsapp.net' };
+  const relays = [];
+  socket.relayMessage = async (jid, content, options) => {
+    relays.push({ jid, content, options });
+    emit('peer-request', [message('anchor')], { progress: 100 });
+    return 'peer-request';
+  };
+  assert.deepEqual(ids(await history.load(request())), ['anchor']);
+  assert.equal(calls.length, 0);
+  assert.equal(relays.length, 1);
+  assert.equal(relays[0].jid, '123@s.whatsapp.net');
+  assert.equal(relays[0].options.additionalAttributes.privacy_sensitive, '1');
+  assert.equal(relays[0].content.protocolMessage.peerDataOperationRequestMessage.historySyncOnDemandRequest.oldestMsgId, 'command');
+  assertClean(ev);
+  history.close();
+});
+
 test('retrieves a phone range using Unix seconds and at most fifty messages per request', async () => {
   const commandTime = 1_793_282_400;
   const phoneRows = Array.from({ length: 55 }, (_, index) => message(
@@ -190,7 +211,7 @@ test('reports an excluded anchor and page direction without exposing message dat
   });
   assert.equal(calls.length, 1);
   assert.deepEqual(diagnostics, [{
-    reason: 'no_progress', pages: 1, retries: 0, requested: 50, chunks: 1, pageRows: 3,
+    reason: 'no_progress', pages: 1, retries: 0, privacySensitive: false, requested: 50, chunks: 1, pageRows: 3,
     cursorIndex: 2, anchorIndex: 0, candidateRows: 0,
     ascending: 2, descending: 0, equal: 0, retained: 0,
     payloadProgress: null, notificationProgress: null, notificationChunkOrder: null,

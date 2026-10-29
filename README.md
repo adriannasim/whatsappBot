@@ -282,7 +282,9 @@ WhatsApp connectivity, account eligibility, history availability, or real infere
   have distinct recovery messages. These failures also log `History diagnostic:`
   with the reason, page/message counts, cursor and anchor positions, and timestamp
   direction counts. They also include bounded response progress and chat-completion
-  metadata. The first-page retry logs `empty_page_retry`, followed by
+  metadata. `privacySensitive: true` identifies the peer request that includes
+  WhatsApp's history-specific relay attribute, missing from pinned Baileys' helper.
+  The first-page retry logs `empty_page_retry`, followed by
   `recovered_after_empty_page` if it recovers the requested range, or another failure.
   Diagnostics contain no message text, message IDs, phone numbers,
   group identifiers, or absolute timestamps. To inspect only these diagnostics,

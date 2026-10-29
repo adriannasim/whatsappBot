@@ -29,13 +29,14 @@ function setup(handler, options = {}) {
       return session;
     },
   };
-  const history = createOnDemandHistory({ getSocket: () => socket, settleMs: 1, timeoutMs: 150, ...options });
+  const history = createOnDemandHistory({ getSocket: () => socket, settleMs: 1, emptyPageRetryMs: 0, timeoutMs: 150, ...options });
   return { history, socket, ev, emit, calls };
 }
 
 function assertClean(ev) {
   assert.equal(ev.listenerCount('messaging-history.set'), 0);
   assert.equal(ev.listenerCount('connection.update'), 0);
+  assert.equal(ev.listenerCount('messages.upsert'), 0);
 }
 
 test('handles an event before the request ID resolves, includes anchor and excludes command/later timestamp ties', async () => {
@@ -189,9 +190,11 @@ test('reports an excluded anchor and page direction without exposing message dat
   });
   assert.equal(calls.length, 1);
   assert.deepEqual(diagnostics, [{
-    reason: 'no_progress', pages: 1, requested: 50, chunks: 1, pageRows: 3,
+    reason: 'no_progress', pages: 1, retries: 0, requested: 50, chunks: 1, pageRows: 3,
     cursorIndex: 2, anchorIndex: 0, candidateRows: 0,
     ascending: 2, descending: 0, equal: 0, retained: 0,
+    payloadProgress: null, notificationProgress: null, notificationChunkOrder: null,
+    chatCount: null, matchingChatCount: null, endOfHistoryTransfer: null, endOfHistoryTransferType: null,
   }]);
   assert.ok(Object.isFrozen(diagnostics[0]));
   assert.doesNotMatch(JSON.stringify(diagnostics), /private-|friends|whatsapp|Message|998|999|1000/);
@@ -204,7 +207,7 @@ test('an empty response produces empty-page guidance even if diagnostics throw',
     onDiagnostic: () => { attempted++; throw new Error('private diagnostic failure'); },
   });
   await assert.rejects(history.load(request()), { code: 'HISTORY_UNAVAILABLE', message: /no earlier messages/ });
-  assert.equal(attempted, 1);
+  assert.equal(attempted, 2);
   assertClean(ev);
 });
 
@@ -336,7 +339,7 @@ test('validates configuration and requires actual command boundaries', async () 
   for (const maxMessages of [0, -1, 1.5, Infinity, '100']) {
     assert.throws(() => createOnDemandHistory({ getSocket: () => ({}), maxMessages }), /maxMessages/);
   }
-  for (const [name, value] of [['timeoutMs', 0], ['settleMs', -1], ['onDemandType', -1], ['onDiagnostic', null]]) {
+  for (const [name, value] of [['timeoutMs', 0], ['settleMs', -1], ['emptyPageRetryMs', -1], ['onDemandType', -1], ['onDiagnostic', null]]) {
     assert.throws(() => createOnDemandHistory({ getSocket: () => ({}), [name]: value }), new RegExp(name));
   }
   const { history, calls } = setup(() => {});

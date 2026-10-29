@@ -230,14 +230,16 @@ for (const loggingThrows of [false, true]) {
     const errors = [];
     const replies = [];
     let summaries = 0;
+    let fetches = 0;
     const ev = new EventEmitter();
     const socket = {
       ev,
       async fetchMessageHistory() {
+        const session = `history-request-${++fetches}`;
         ev.emit('messaging-history.set', {
-          syncType: 6, peerDataRequestSessionId: 'history-request', messages: [], progress: 100,
+          syncType: 6, peerDataRequestSessionId: session, messages: [], progress: 100,
         });
-        return 'history-request';
+        return session;
       },
       async sendMessage(groupId, content) {
         replies.push(content.text);
@@ -245,7 +247,7 @@ for (const loggingThrows of [false, true]) {
       },
     };
     const bot = createWhatsAppBot({
-      config: { groupIds: new Set([GROUP]), maxMessages: 3000, historyTimeoutMs: 2000 },
+      config: { groupIds: new Set([GROUP]), maxMessages: 3000, historyTimeoutMs: 6000 },
       getSocket: () => socket,
       getOwnIds: () => OWN_IDS,
       summarize: async () => { summaries++; return 'Unexpected summary'; },
@@ -258,17 +260,22 @@ for (const loggingThrows of [false, true]) {
 
     assert.deepEqual(await bot.handleMessages([command()]), ['failed']);
     const diagnostics = errors.filter(error => error.startsWith('History diagnostic: '));
-    assert.equal(diagnostics.length, 1);
-    const diagnostic = JSON.parse(diagnostics[0].slice('History diagnostic: '.length));
+    assert.equal(diagnostics.length, 2);
+    const retryDiagnostic = JSON.parse(diagnostics[0].slice('History diagnostic: '.length));
+    assert.equal(retryDiagnostic.reason, 'empty_page_retry');
+    const diagnostic = JSON.parse(diagnostics[1].slice('History diagnostic: '.length));
     assert.equal(diagnostic.reason, 'empty_page');
-    assert.equal(diagnostic.pages, 1);
+    assert.equal(diagnostic.pages, 2);
+    assert.equal(diagnostic.retries, 1);
     assert.equal(diagnostic.pageRows, 0);
+    assert.equal(fetches, 2);
     assert.equal(summaries, 0);
     assert.deepEqual(replies, ['WhatsApp returned no earlier messages before reaching the starting message. Please try again with a new !summarise reply.']);
-    assert.equal(errors.length, 2);
-    assert.equal(errors[1], `History retrieval failed: ${replies[0]}`);
+    assert.equal(errors.length, 3);
+    assert.equal(errors[2], `History retrieval failed: ${replies[0]}`);
     assert.equal(ev.listenerCount('connection.update'), 0);
     assert.equal(ev.listenerCount('messaging-history.set'), 0);
+    assert.equal(ev.listenerCount('messages.upsert'), 0);
   });
 }
 

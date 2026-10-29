@@ -220,10 +220,12 @@ does not deploy it to your Dot. See the [Dot computers guide](https://learn.chat
 
 - Only a valid command with a real bot mention and quoted starting message triggers
   history retrieval. Requests page backward from the command in batches of up to
-  100 messages, within the configured cap (3,000 by default).
+  50 messages, within the configured cap (3,000 by default).
 - Baileys asks the bot account's primary phone for history. Keep that phone online.
   Requests can still time out, be rejected, or return limited history. An anchor
   from before the bot joined, or one absent from the phone, may be unavailable.
+  An empty first response triggers one retry of the same command boundary after
+  two seconds, within the original timeout, to allow for delivery lag on the phone.
 - The exact quoted starting message must be retrieved before any transcript is
   sent to AI. If it is missing, the bot asks for a newer starting point or a retry;
   it does not silently substitute a different range.
@@ -279,7 +281,10 @@ WhatsApp connectivity, account eligibility, history availability, or real infere
   Empty responses, pages that make no progress, and the configured message cap
   have distinct recovery messages. These failures also log `History diagnostic:`
   with the reason, page/message counts, cursor and anchor positions, and timestamp
-  direction counts. Diagnostics contain no message text, message IDs, phone numbers,
+  direction counts. They also include bounded response progress and chat-completion
+  metadata. The first-page retry logs `empty_page_retry`, followed by
+  `recovered_after_empty_page` if it recovers the requested range, or another failure.
+  Diagnostics contain no message text, message IDs, phone numbers,
   group identifiers, or absolute timestamps. To inspect only these diagnostics,
   run `sudo journalctl -u whatsapp-summary-bot.service --since '10 minutes ago' --no-pager -o cat | grep -F 'History diagnostic:'`.
   If fresh messages also fail while WhatsApp is open on the bot phone, use this

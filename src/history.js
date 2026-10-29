@@ -1,4 +1,5 @@
 import { HistoryUnavailableError } from './history-error.js';
+import { normalizeMessageContent, proto } from '@whiskeysockets/baileys';
 
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_EARLY_EVENTS = 32;
@@ -68,6 +69,7 @@ export function createOnDemandHistory({
   maxMessages = 3000,
   timeoutMs = 30000,
   settleMs = 750,
+  emptyPageRetryMs = 2000,
   onDemandType = 6, // proto.HistorySync.HistorySyncType.ON_DEMAND
   onDiagnostic = () => {},
 } = {}) {
@@ -76,6 +78,7 @@ export function createOnDemandHistory({
   if (!Number.isSafeInteger(maxMessages) || maxMessages < 1) throw new TypeError('maxMessages must be a positive integer');
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new TypeError('timeoutMs must be a positive integer');
   if (!Number.isSafeInteger(settleMs) || settleMs < 0) throw new TypeError('settleMs must be a non-negative integer');
+  if (!Number.isSafeInteger(emptyPageRetryMs) || emptyPageRetryMs < 0) throw new TypeError('emptyPageRetryMs must be a non-negative integer');
   if (!Number.isSafeInteger(onDemandType) || onDemandType < 0) throw new TypeError('onDemandType must be a non-negative integer');
 
   const queue = [];
@@ -95,20 +98,49 @@ export function createOnDemandHistory({
     let abort;
     let pages = 0;
     let pageStats;
+    let retries = 0;
+    let retryTimer;
 
-    function missingAnchor(reason, message) {
+    function diagnose(reason) {
       // Only bounded counts and positions from this command. Never include
       // message contents, IDs, participant/group JIDs, or absolute timestamps.
       try {
-        onDiagnostic(Object.freeze({ reason, pages, ...pageStats, retained: reverseMessages.length }));
+        onDiagnostic(Object.freeze({ reason, pages, retries, ...pageStats, retained: reverseMessages.length }));
       } catch { /* Diagnostics must not prevent the normal recovery reply. */ }
+    }
+
+    function missingAnchor(reason, message) {
+      diagnose(reason);
       return unavailable(message);
+    }
+
+    function snapshotPage() {
+      const chunks = page.chunks;
+      const rows = chunks.flatMap(chunk => chunk.rows);
+      const stats = {
+        requested: page.requested, chunks: chunks.length, pageRows: rows.length,
+        cursorIndex: -1, anchorIndex: rows.findIndex(message => message.key.id === request.startId),
+        candidateRows: rows.length, ascending: 0, descending: 0, equal: 0,
+        payloadProgress: chunks.reduce((highest, chunk) => chunk.progress === null ? highest : Math.max(highest ?? 0, chunk.progress), null),
+        notificationProgress: [...page.notifications.values()].reduce((highest, item) => item.progress === null ? highest : Math.max(highest ?? 0, item.progress), null),
+        notificationChunkOrder: [...page.notifications.keys()].reduce((highest, order) => order === null ? highest : Math.max(highest ?? 0, order), null),
+        ...(chunks.at(-1)?.metadata ?? { chatCount: null, matchingChatCount: null, endOfHistoryTransfer: null, endOfHistoryTransferType: null }),
+      };
+      for (let index = 1; index < rows.length; index++) {
+        const difference = timestampSeconds(rows[index].messageTimestamp) - timestampSeconds(rows[index - 1].messageTimestamp);
+        stats[difference > 0 ? 'ascending' : difference < 0 ? 'descending' : 'equal']++;
+      }
+      return stats;
     }
 
     const failure = new Promise((_, reject) => {
       abort = () => reject(controller.signal.reason);
       controller.signal.addEventListener('abort', abort, { once: true });
-      deadline = setTimeout(() => reject(unavailable('WhatsApp did not finish sending history. Keep the bot account\'s phone online and try again, or reply to a more recent message.')), timeoutMs);
+      deadline = setTimeout(() => {
+        try { if (page) pageStats = snapshotPage(); } catch { /* A diagnostic cannot prevent timeout. */ }
+        diagnose('timeout');
+        reject(unavailable('WhatsApp did not finish sending history. Keep the bot account\'s phone online and try again, or reply to a more recent message.'));
+      }, timeoutMs);
     });
     // Attach immediately: socket events can arrive before a page starts awaiting it.
     failure.catch(() => {});
@@ -133,11 +165,83 @@ export function createOnDemandHistory({
 
     function finishPageSoon() {
       clearTimeout(page?.settleTimer);
-      if (!page || (page.progress !== undefined && page.progress < 100)) return;
+      if (!page?.chunks.length) return;
+      if (page.unnumberedNotifications > page.chunks.filter(chunk => chunk.order === null).length) return;
+      // Without chunk numbers, multiple notifications cannot be paired with
+      // downloads safely. Require an explicit completed payload in that case.
+      if (page.unnumberedNotifications > 1 && !page.chunks.some(chunk => chunk.progress === 100)) return;
+      // Notifications arrive before their payloads are downloaded. Do not let
+      // a final notification settle an earlier empty chunk while its own
+      // payload is still pending. Match progress by this session's chunk.
+      if ([...page.notifications.keys()].some(order => !page.chunks.some(chunk => chunk.order === order))) return;
+      const progress = page.chunks.reduce((highest, chunk) => {
+        const value = chunk.progress ?? page.notifications.get(chunk.order)?.progress;
+        return value == null ? highest : Math.max(highest ?? 0, value);
+      }, null);
+      if (progress !== null && progress < 100) return;
       page.settleTimer = setTimeout(() => page?.resolve(), settleMs);
     }
 
-    function receiveForPage(event) {
+    function historyMetadata(event) {
+      const chats = Array.isArray(event.chats) && event.chats.length <= maxMessages + 100 ? event.chats : null;
+      const matching = chats?.filter(chat => chat?.id === request.groupId);
+      const target = matching?.length === 1 ? matching[0] : null;
+      return {
+        chatCount: chats?.length ?? null,
+        matchingChatCount: matching?.length ?? null,
+        endOfHistoryTransfer: typeof target?.endOfHistoryTransfer === 'boolean' ? target.endOfHistoryTransfer : null,
+        endOfHistoryTransferType: [0, 1, 2].includes(target?.endOfHistoryTransferType) ? target.endOfHistoryTransferType : null,
+      };
+    }
+
+    function receiveNotification(metadata) {
+      if (!page || metadata.session !== page.id) return;
+      if (!page.notifications.has(metadata.order) && page.notifications.size >= MAX_CHUNKS_PER_PAGE) {
+        page.reject(unavailable('WhatsApp sent too many history chunks. Please try a more recent starting message.'));
+        return;
+      }
+      const previous = page.notifications.get(metadata.order);
+      if (metadata.order === null) page.unnumberedNotifications++;
+      const progress = metadata.progress === null ? previous?.progress ?? null
+        : Math.max(previous?.progress ?? 0, metadata.progress);
+      page.notifications.set(metadata.order, { progress });
+      finishPageSoon();
+    }
+
+    function observeMessages(event) {
+      if (!page || !Array.isArray(event?.messages)) return;
+      for (const message of event.messages) {
+        if (message?.key?.fromMe !== true) continue;
+        const protocol = normalizeMessageContent(message.message)?.protocolMessage;
+        if (protocol?.type !== proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION) continue;
+        const notification = protocol.historySyncNotification;
+        const session = notification?.peerDataRequestSessionId;
+        if (notification?.syncType !== onDemandType || typeof session !== 'string' || !session) continue;
+        const metadata = {
+          session,
+          progress: Number.isFinite(notification.progress) && notification.progress >= 0 && notification.progress <= 100 ? notification.progress : null,
+          order: Number.isSafeInteger(notification.chunkOrder) && notification.chunkOrder >= 0 ? notification.chunkOrder : null,
+        };
+        if (page.id) receiveNotification(metadata);
+        else {
+          // Retain only bounded primitive metadata, never the notification,
+          // which can contain media credentials or an inline chat payload.
+          page.earlyBytes += byteLength(metadata);
+          if (page.earlyNotifications.length >= MAX_EARLY_EVENTS || page.earlyBytes + retainedBytes > MAX_BUFFER_BYTES) {
+            page.reject(unavailable('That history response is too large. Please reply to a more recent message.'));
+            return;
+          }
+          page.earlyNotifications.push(metadata);
+        }
+      }
+    }
+
+    function onMessages(event) {
+      try { observeMessages(event); }
+      catch { /* Optional metadata must never prevent Baileys from receiving an event. */ }
+    }
+
+    function receiveForPage(event, metadata) {
       if (!page || event.peerDataRequestSessionId !== page.id) return;
       try {
         if (!Array.isArray(event.messages)) throw unavailable('WhatsApp returned malformed history. Please try again.');
@@ -165,13 +269,12 @@ export function createOnDemandHistory({
           if (!Number.isFinite(event.progress) || event.progress < 0 || event.progress > 100) {
             throw unavailable('WhatsApp returned invalid history progress. Please try again.');
           }
-          page.progress = Math.max(page.progress ?? 0, event.progress);
         }
         if (event.chunkOrder != null && (!Number.isSafeInteger(event.chunkOrder) || event.chunkOrder < 0)) {
           throw unavailable('WhatsApp returned an invalid history chunk. Please try again.');
         }
         if (page.chunks.length >= MAX_CHUNKS_PER_PAGE) throw unavailable('WhatsApp sent too many history chunks. Please try a more recent starting message.');
-        page.chunks.push({ rows, order: event.chunkOrder, received: page.chunks.length });
+        page.chunks.push({ rows, order: event.chunkOrder ?? null, progress: event.progress ?? null, metadata, received: page.chunks.length });
         finishPageSoon();
       } catch (error) {
         page.reject(error.code === 'HISTORY_UNAVAILABLE' ? error : unavailable('WhatsApp returned malformed history. Please try again.'));
@@ -181,7 +284,7 @@ export function createOnDemandHistory({
     function onHistory(event) {
       if (!page || event?.syncType !== onDemandType || typeof event.peerDataRequestSessionId !== 'string' || !event.peerDataRequestSessionId) return;
       if (page.id) {
-        receiveForPage(event);
+        receiveForPage(event, historyMetadata(event));
       } else {
         // Events can arrive before fetchMessageHistory resolves with its request ID.
         // Bound this short-lived buffer and replay only the exact matching session.
@@ -195,6 +298,7 @@ export function createOnDemandHistory({
             peerDataRequestSessionId: event.peerDataRequestSessionId,
             progress: event.progress,
             chunkOrder: event.chunkOrder,
+            metadata: historyMetadata(event),
           };
           page.earlyBytes += byteLength(snapshot);
           if (page.early.length >= MAX_EARLY_EVENTS || page.earlyBytes + retainedBytes > MAX_BUFFER_BYTES || (Array.isArray(relevant) && relevant.length > maxMessages + 100)) {
@@ -215,6 +319,7 @@ export function createOnDemandHistory({
     let observingRawHistory = false;
     function emitWithHistoryObserver(...args) {
       if (args[0] === 'messaging-history.set') onHistory(args[1]);
+      if (args[0] === 'messages.upsert') onMessages(args[1]);
       return Reflect.apply(originalEmit, this, args);
     }
     try {
@@ -230,6 +335,7 @@ export function createOnDemandHistory({
       } else {
         // Compatibility with adapters that only expose subscription methods.
         socket.ev.on('messaging-history.set', onHistory);
+        socket.ev.on('messages.upsert', onMessages);
       }
       socket.ev.on('connection.update', onConnection);
       let cursorKey = request.endKey;
@@ -239,8 +345,8 @@ export function createOnDemandHistory({
         let rejectPage;
         const completed = new Promise((resolve, reject) => { resolvePage = resolve; rejectPage = reject; });
         completed.catch(() => {});
-        page = { id: undefined, chunks: [], early: [], earlyBytes: 0, bytes: 0, count: 0, resolve: resolvePage, reject: rejectPage };
         const count = Math.min(MAX_PAGE_MESSAGES, maxMessages - reverseMessages.length);
+        page = { id: undefined, requested: count, chunks: [], notifications: new Map(), unnumberedNotifications: 0, early: [], earlyNotifications: [], earlyBytes: 0, bytes: 0, count: 0, resolve: resolvePage, reject: rejectPage };
         pages++;
         const session = await Promise.race([
           Promise.resolve().then(() => {
@@ -253,9 +359,12 @@ export function createOnDemandHistory({
         if (typeof session !== 'string' || !session) throw unavailable('WhatsApp did not identify the history request. Please try again.');
         page.id = session;
         const early = page.early;
+        const earlyNotifications = page.earlyNotifications;
         page.early = [];
+        page.earlyNotifications = [];
         page.earlyBytes = 0;
-        for (const event of early) receiveForPage(event);
+        for (const metadata of earlyNotifications) receiveNotification(metadata);
+        for (const event of early) receiveForPage(event, event.metadata);
         await Promise.race([completed, failure]);
         clearTimeout(page.settleTimer);
 
@@ -266,15 +375,7 @@ export function createOnDemandHistory({
           chunks.sort((a, b) => a.order - b.order || a.received - b.received);
         }
         let rows = chunks.flatMap((chunk) => chunk.rows);
-        pageStats = {
-          requested: count, chunks: chunks.length, pageRows: rows.length,
-          cursorIndex: -1, anchorIndex: rows.findIndex(message => message.key.id === request.startId),
-          candidateRows: rows.length, ascending: 0, descending: 0, equal: 0,
-        };
-        for (let index = 1; index < rows.length; index++) {
-          const difference = timestampSeconds(rows[index].messageTimestamp) - timestampSeconds(rows[index - 1].messageTimestamp);
-          pageStats[difference > 0 ? 'ascending' : difference < 0 ? 'descending' : 'equal']++;
-        }
+        pageStats = snapshotPage();
         let cursorIndex = -1;
         let cursorIdPresent = false;
         for (let index = 0; index < rows.length; index++) {
@@ -312,12 +413,29 @@ export function createOnDemandHistory({
               ? message.key.fromMe === true
               : (request.startFromMe !== false || message.key.fromMe === false)
                 && await matchesVerifiedParticipant(message.key, request.startParticipant);
-            if (anchorSenderMatches) return Object.freeze(reverseMessages.slice().reverse());
+            if (anchorSenderMatches) {
+              if (retries) diagnose('recovered_after_empty_page');
+              return Object.freeze(reverseMessages.slice().reverse());
+            }
             throw unavailable('WhatsApp returned the starting message but its sender could not be verified. Please try again with a new !summarise command.');
           }
           if (reverseMessages.length >= maxMessages) break;
         }
         if (!oldest) {
+          if (pages === 1 && retries === 0 && pageStats.pageRows === 0) {
+            retries = 1;
+            diagnose('empty_page_retry');
+            // Supersede this settled empty response. Late chunks from its
+            // session are ignored; the retry asks for the same exact cursor.
+            page = undefined;
+            await Promise.race([
+              new Promise(resolve => { retryTimer = setTimeout(resolve, emptyPageRetryMs); }),
+              failure,
+            ]);
+            clearTimeout(retryTimer);
+            retryTimer = undefined;
+            continue;
+          }
           throw missingAnchor(pageStats.pageRows === 0 ? 'empty_page' : 'no_progress',
             pageStats.pageRows === 0
               ? 'WhatsApp returned no earlier messages before reaching the starting message. Please try again with a new !summarise reply.'
@@ -330,12 +448,14 @@ export function createOnDemandHistory({
       throw missingAnchor('limit_reached', 'I could not load the starting message within the configured history limit. Please reply to a more recent message.');
     } finally {
       clearTimeout(deadline);
+      clearTimeout(retryTimer);
       clearTimeout(page?.settleTimer);
       controller.signal.removeEventListener('abort', abort);
       if (observingRawHistory) {
         if (socket.ev.emit === emitWithHistoryObserver) socket.ev.emit = originalEmit;
       } else {
         socket.ev.off('messaging-history.set', onHistory);
+        socket.ev.off('messages.upsert', onMessages);
       }
       socket.ev.off('connection.update', onConnection);
       page = undefined;

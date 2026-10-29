@@ -170,6 +170,7 @@ test('emit-less adapters retain listener-based history support and cleanup', asy
     assert.deepEqual(ids(await history.load(request())), ['anchor']);
     assert.equal(source.listenerCount('messaging-history.set'), 0);
     assert.equal(source.listenerCount('connection.update'), 0);
+    assert.equal(source.listenerCount('messages.upsert'), 0);
     assert.equal(ev.emit, undefined);
   } finally {
     history.close();

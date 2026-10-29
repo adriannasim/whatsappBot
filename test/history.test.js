@@ -22,10 +22,10 @@ function setup(handler, options = {}) {
   });
   const socket = {
     ev,
-    async fetchMessageHistory(count, key, timestampMs) {
+    async fetchMessageHistory(count, key, timestampSeconds) {
       const session = `request-${calls.length + 1}`;
-      calls.push({ count, key, timestampMs, session });
-      await handler?.({ count, key, timestampMs, session, emit, calls, ev });
+      calls.push({ count, key, timestampSeconds, session });
+      await handler?.({ count, key, timestampSeconds, session, emit, calls, ev });
       return session;
     },
   };
@@ -45,7 +45,7 @@ test('handles an event before the request ID resolves, includes anchor and exclu
   assert.deepEqual(ids(result), ['anchor', 'middle']);
   assert.equal(result[0], rows[3]);
   assert.equal(Object.isFrozen(result), true);
-  assert.equal(calls[0].timestampMs, 1000000);
+  assert.equal(calls[0].timestampSeconds, 1000);
   assert.equal(calls[0].key.id, 'command');
   assert.deepEqual(ids(rows), ['later', 'command', 'middle', 'anchor', 'before']);
   assertClean(ev);
@@ -60,7 +60,32 @@ test('pages backwards using each oldest actual key and retains equal-second prot
   });
   assert.deepEqual(ids(await history.load(request())), ['anchor', 'middle', 'newer']);
   assert.deepEqual(calls.map((call) => call.key.id), ['command', 'middle']);
-  assert.deepEqual(calls.map((call) => call.timestampMs), [1000000, 1000000]);
+  assert.deepEqual(calls.map((call) => call.timestampSeconds), [1000, 1000]);
+  assertClean(ev);
+});
+
+test('retrieves a phone range using Unix seconds and at most fifty messages per request', async () => {
+  const commandTime = 1_793_282_400;
+  const phoneRows = Array.from({ length: 55 }, (_, index) => message(
+    index === 54 ? 'anchor' : `history-${index}`,
+    { low: commandTime - index - 1, high: 0, unsigned: true },
+  ));
+  const { history, calls, ev } = setup(({ count, key, timestampSeconds, session, emit }) => {
+    const cursorIndex = key.id === 'command' ? -1 : phoneRows.findIndex(row => row.key.id === key.id);
+    const expectedTime = cursorIndex === -1 ? commandTime : phoneRows[cursorIndex].messageTimestamp.low;
+    // Model a phone that returns an empty page when the request violates
+    // the documented timestamp units or fifty-message limit.
+    const rows = timestampSeconds === expectedTime && count <= 50
+      ? phoneRows.slice(cursorIndex + 1, cursorIndex + 1 + count) : [];
+    emit(session, rows, { progress: 100 });
+  }, { maxMessages: 55 });
+
+  const result = await history.load(request({ endTimestamp: { toNumber: () => commandTime } }));
+  assert.deepEqual(ids(result), ids(phoneRows).reverse());
+  assert.deepEqual(calls.map(({ count, key, timestampSeconds }) => ({ count, key, timestampSeconds })), [
+    { count: 50, key: message('command').key, timestampSeconds: commandTime },
+    { count: 5, key: phoneRows[49].key, timestampSeconds: commandTime - 50 },
+  ]);
   assertClean(ev);
 });
 
@@ -164,7 +189,7 @@ test('reports an excluded anchor and page direction without exposing message dat
   });
   assert.equal(calls.length, 1);
   assert.deepEqual(diagnostics, [{
-    reason: 'no_progress', pages: 1, requested: 100, chunks: 1, pageRows: 3,
+    reason: 'no_progress', pages: 1, requested: 50, chunks: 1, pageRows: 3,
     cursorIndex: 2, anchorIndex: 0, candidateRows: 0,
     ascending: 2, descending: 0, equal: 0, retained: 0,
   }]);
@@ -198,10 +223,10 @@ test('rejects future, reversed and malformed timestamps rather than manufacturin
   }
 });
 
-test('understands protobuf Long timestamps and converts the cursor to milliseconds', async () => {
+test('understands protobuf Long timestamps and preserves Unix seconds for the cursor', async () => {
   const { history, calls } = setup(({ session, emit }) => emit(session, [message('anchor', { low: 999, high: 0, unsigned: true })]));
   assert.deepEqual(ids(await history.load(request({ endTimestamp: { toNumber: () => 1000 } }))), ['anchor']);
-  assert.equal(calls[0].timestampMs, 1000000);
+  assert.equal(calls[0].timestampSeconds, 1000);
 });
 
 test('matches an explicitly supplied anchor participant including device suffix and alternate PN', async () => {

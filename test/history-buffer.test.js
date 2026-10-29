@@ -35,9 +35,9 @@ function fixture(t, handler, options = {}) {
   ev.on('messaging-history.set', event => delivered.push(event));
   const socket = {
     ev,
-    async fetchMessageHistory(count, key, timestampMs) {
+    async fetchMessageHistory(count, key, timestampSeconds) {
       const session = `request-${calls.length + 1}`;
-      calls.push({ count, key, timestampMs, session });
+      calls.push({ count, key, timestampSeconds, session });
       await handler({ ev, calls, session, emit: (rows, extra) => ev.emit('messaging-history.set', historyEvent(session, rows, extra)) });
       return session;
     },

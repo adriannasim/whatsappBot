@@ -4,6 +4,7 @@ const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_EARLY_EVENTS = 32;
 const MAX_CHUNKS_PER_PAGE = 128;
 const MAX_QUEUED_REQUESTS = 20;
+const MAX_PAGE_MESSAGES = 50; // Baileys' documented maximum per history query.
 
 function unavailable(message) {
   return new HistoryUnavailableError(message);
@@ -56,7 +57,9 @@ function validateRequest({ groupId, startId, startParticipant, startFromMe, endK
 /**
  * Fetch history from the primary phone only while a command is running.
  * Baileys emits reverse chronological pages and returns a request ID, not messages.
- * endTimestamp uses Baileys' Unix seconds; fetchMessageHistory requires milliseconds.
+ * endTimestamp and fetchMessageHistory both use Unix seconds, despite the
+ * protocol field name oldestMsgTimestampMs. See Baileys v7.0.0-rc14's example:
+ * https://github.com/WhiskeySockets/Baileys/blob/v7.0.0-rc14/Example/example.ts
  * A response without progress metadata is considered settled after settleMs of quiet.
  * This returns the available range, not a guarantee that WhatsApp retained every message.
  */
@@ -237,12 +240,12 @@ export function createOnDemandHistory({
         const completed = new Promise((resolve, reject) => { resolvePage = resolve; rejectPage = reject; });
         completed.catch(() => {});
         page = { id: undefined, chunks: [], early: [], earlyBytes: 0, bytes: 0, count: 0, resolve: resolvePage, reject: rejectPage };
-        const count = Math.min(100, maxMessages - reverseMessages.length);
+        const count = Math.min(MAX_PAGE_MESSAGES, maxMessages - reverseMessages.length);
         pages++;
         const session = await Promise.race([
           Promise.resolve().then(() => {
             if (controller.signal.aborted) throw controller.signal.reason;
-            return socket.fetchMessageHistory(count, cursorKey, cursorTimestamp * 1000);
+            return socket.fetchMessageHistory(count, cursorKey, cursorTimestamp);
           }),
           completed.then(() => { throw unavailable('WhatsApp returned history before its request was identified. Please try again.'); }),
           failure,

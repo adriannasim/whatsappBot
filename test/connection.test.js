@@ -147,6 +147,33 @@ test('temporary disconnections reconnect with capped backoff and discard old soc
   assert.equal([...f.timerJobs.values()][0].delay, 100);
 });
 
+test('content edits and deletions erase retained content while receipt updates do not', async t => {
+  const changed = [];
+  const cleared = [];
+  const f = await fixture(t, {
+    onMessageChanges: keys => changed.push(keys),
+    onChatMessagesDeleted: jid => cleared.push(jid),
+  });
+  await f.connection.start();
+  const events = f.sockets[0].ev;
+  const key = { remoteJid: '123-456@g.us', id: 'message', fromMe: false };
+  events.emit('messages.update', [{ key, update: { status: 4 } }]);
+  assert.equal(changed.length, 0);
+  events.emit('messages.update', [{ key, update: { message: null, messageStubType: 1 } }]);
+  events.emit('messages.update', [{ key, update: { message: { conversation: 'edited' } } }]);
+  events.emit('messages.delete', { keys: [key] });
+  events.emit('messages.delete', { all: true, jid: key.remoteJid });
+  assert.deepEqual(changed, [[key], [key], [key]]);
+  assert.deepEqual(cleared, [key.remoteJid]);
+  f.close();
+  events.emit('messages.update', [{ key, update: { message: null } }]);
+  events.emit('messages.delete', { all: true, jid: key.remoteJid });
+  assert.equal(changed.length, 3);
+  assert.equal(cleared.length, 1);
+  assert.equal(events.listenerCount('messages.update'), 0);
+  assert.equal(events.listenerCount('messages.delete'), 0);
+});
+
 test('restart-required reconnects without deleting credentials and repeated failures are bounded', async t => {
   const f = await fixture(t, { maxReconnectAttempts: 2 });
   await f.connection.start();

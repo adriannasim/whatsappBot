@@ -270,7 +270,7 @@ for (const loggingThrows of [false, true]) {
     assert.equal(diagnostic.pageRows, 0);
     assert.equal(fetches, 2);
     assert.equal(summaries, 0);
-    assert.deepEqual(replies, ['WhatsApp returned no earlier messages before reaching the starting message. Please try again with a new !summarise reply.']);
+    assert.deepEqual(replies, ['WhatsApp returned no earlier messages. Reply to a newer message sent while the bot is connected, mention the bot, and send !summarise.']);
     assert.equal(errors.length, 3);
     assert.equal(errors[2], `History retrieval failed: ${replies[0]}`);
     assert.equal(ev.listenerCount('connection.update'), 0);

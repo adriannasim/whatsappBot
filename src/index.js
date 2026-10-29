@@ -56,10 +56,14 @@ connection = createWhatsAppConnection({
   },
   getMessage: key => bot?.getMessage(key),
   onMessages: messages => bot?.handleMessages(messages),
+  onMessageChanges: keys => bot?.invalidateMessages(keys),
+  onChatMessagesDeleted: groupId => bot?.discardGroup(groupId),
+  onDisconnect: () => bot?.clearRecentMessages(),
   onOpen: async socket => {
     if (stopping) return;
     if (!listGroups) {
       console.log(`Ready in ${config.groupIds.size} selected group(s). Waiting for @mention !summarise replies.`);
+      console.log('Temporary message buffer: up to 24 hours and 3000 messages per selected group, within a 32 MiB total limit. Empty after restart or disconnect.');
       return;
     }
     try {

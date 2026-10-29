@@ -31,7 +31,7 @@ function iso(timestamp) {
 }
 
 /**
- * Fetch history from WhatsApp only when a mentioned command has a quoted start.
+ * Load a buffered range or phone history when a mentioned command has a quoted start.
  * loadMessages must return the requested range, inclusive of the anchor and
  * exclusive of the command. No conversation history is persisted here.
  */

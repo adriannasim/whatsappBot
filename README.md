@@ -7,9 +7,11 @@ Reply to the message where a summary should begin, select the bot from WhatsApp'
 @SummaryBot !summarise
 ```
 
-The bot requests available group history on demand and summarises from the quoted
-message **inclusive** to your command **exclusive**. It replies in the same group.
-Messages after the command and the bot's previous replies are excluded.
+The bot summarises from the quoted message **inclusive** to your command
+**exclusive**, using recently received messages held in memory first. If that
+range is unavailable locally, it requests available history from the bot phone.
+It replies in the same group. Messages after the command and the bot's previous
+replies are excluded.
 
 WhatsApp connectivity uses [Baileys](https://baileys.wiki/), directly from Node.js.
 No Chrome installation or browser process is needed for WhatsApp. The default AI
@@ -17,18 +19,20 @@ mode uses **Continue with ChatGPT**, with a model you can choose in `.env`, thro
 OpenAI's [official sign-in integration](https://developers.openai.com/siwc/token-sharing-open-source).
 ChatGPT sign-in still uses a browser for consent.
 
-There is **no separate message database or continuous transcript archive**. The
-application collects history only while handling a valid summary command, then
-releases that request's buffer. It does not request a full history sync at startup.
-Baileys authentication and encryption keys are saved so the linked device can
-reconnect. A small, temporary cache of the bot's outgoing replies supports
-WhatsApp delivery retries; it is not an incoming-message archive.
+The bot keeps a **temporary incoming-message buffer in RAM for allowed groups**.
+It retains only text/captions and the metadata needed to identify senders and range
+boundaries, for up to **24 hours and 3,000 messages per group**. A **32 MiB global
+buffer cap** can evict messages earlier. Restarting the process or disconnecting
+WhatsApp clears the buffer. The application does not write incoming messages to
+disk, download media, or request a full history sync at startup. Baileys saves
+authentication and encryption keys so the linked device can reconnect. A separate
+small cache of outgoing bot replies supports WhatsApp delivery retries.
 
 ## What you need
 
 - Node.js **24 or later** on a computer that stays on while the bot is in use.
 - A WhatsApp account for the bot, added to your friends' group. Keep its **primary
-  phone online** when requesting summaries: on-demand history comes from that phone.
+  phone online** when older or missing messages need to be fetched from that phone.
 - A ChatGPT account with permission to share plan usage with this app. Sign-in and
   model discovery determine the actual account/workspace access.
 - Group members who know that requested conversation excerpts are sent to OpenAI
@@ -134,10 +138,12 @@ reported by the newly linked account before starting.
    npm start
    ```
 
-   From your own account, reply to a group message, select the bot in the mention
-   picker, and send `!summarise` in that same reply. Typing a display name without
-   making an actual mention will not trigger it. The bot account cannot trigger
-   itself.
+   After the bot is connected, send a few new messages in an allowed group. From
+   your own account, reply to the first of those messages, select the bot in the
+   mention picker, and send `!summarise` in that same reply. Typing a display name
+   without making an actual mention will not trigger it. The bot account cannot
+   trigger itself. The buffer starts empty after each deployment/restart and after
+   a disconnect; re-linking WhatsApp is not needed to start collecting new messages.
 
 Keep the process running and the bot phone available for history requests. Stop
 with Ctrl+C. The saved Baileys session normally avoids another QR scan on restart;
@@ -218,15 +224,22 @@ does not deploy it to your Dot. See the [Dot computers guide](https://learn.chat
 
 ## History and summary limits
 
-- Only a valid command with a real bot mention and quoted starting message triggers
-  history retrieval. Requests page backward from the command in batches of up to
-  50 messages, within the configured cap (3,000 by default).
-- Baileys asks the bot account's primary phone for history. Keep that phone online.
-  Requests can still time out, be rejected, or return limited history. An anchor
-  from before the bot joined, or one absent from the phone, may be unavailable.
+- Incoming messages from allowed groups are buffered while the bot is connected.
+  A valid command with a real bot mention and quoted starting message first checks
+  whether the buffer contains the complete available range from that start to the
+  command. If it does, the bot uses that range without fetching phone history.
+- The buffer retains minimal text/captions and sender/boundary metadata for up to
+  24 hours, at most 3,000 messages per allowed group, and 32 MiB across all groups.
+  Size limits can evict messages sooner. Restart or WhatsApp disconnect clears it;
+  messages sent before the next connection are not recovered into the buffer.
+- For an older or missing range, Baileys asks the bot account's primary phone for
+  history. Requests page backward from the command in batches of up to 50 messages,
+  within the configured cap (3,000 by default). Keep the phone online for this
+  fallback. Requests can still time out, be rejected, or return limited history.
+  An anchor from before the bot joined, or one absent from the phone, may be unavailable.
   An empty first response triggers one retry of the same command boundary after
   two seconds, within the original timeout, to allow for delivery lag on the phone.
-- The exact quoted starting message must be retrieved before any transcript is
+- The exact quoted starting message must be available before any transcript is
   sent to AI. If it is missing, the bot asks for a newer starting point or a retry;
   it does not silently substitute a different range.
 - The command supplies the ending boundary. Later messages and previous bot replies
@@ -234,17 +247,19 @@ does not deploy it to your Dot. See the [Dot computers guide](https://learn.chat
   message does not prove that every message in the range was retained by WhatsApp.
 - Text and image/video/document captions are supported. Voice notes, image/file
   contents, and view-once messages are not summarised. Deleted messages, summary
-  commands, and the bot's own messages are excluded. Old edits and deleted content
-  cannot be reconstructed.
+  commands, and the bot's own messages are excluded. When the bot receives an edit
+  or deletion, it removes the previous buffered content; edited messages may be
+  omitted from summaries. Old edits and deleted content cannot be reconstructed.
 - AI input is capped at 60,000 characters including names and timestamps. Oversized
   requests ask for a newer start; input is not silently truncated.
 - One summary per group runs at a time, with a 30-second cooldown after success.
   History requests to the primary phone are queued. Recent command IDs are kept
   briefly in memory to suppress duplicate events; transcripts are not stored with
   those IDs. This protection resets on restart.
-- Request history buffers are temporary. Up to 50 outgoing bot replies can remain
-  in memory for up to five minutes to support delivery retries. No continuous
-  incoming-message store or transcript file is maintained.
+- Phone-history responses are held only for the active request. Separately, up to
+  50 outgoing bot replies can remain in memory for five minutes to support delivery
+  retries. The incoming RAM buffer is bounded as above; no transcript file or
+  message database is maintained.
 - The model summarises topics, decisions, actions, and unanswered questions in the
   conversation's main language, without tools. Verify important details against
   the original messages: summaries can contain mistakes.
@@ -258,7 +273,9 @@ WhatsApp credentials and encryption state in `.baileys-auth` (`WA_AUTH_DIR`). Ke
 these directories and `.env` private. Run only one active bot instance against a
 WhatsApp session directory. Do not share those files through Git or chat.
 
-The application does not log transcripts or tokens. Selected participant names,
+Allowed-group text/captions and minimal sender/boundary metadata remain temporarily
+in process memory within the limits above. The application does not log transcripts
+or tokens or write incoming messages to disk. Selected participant names,
 timestamps, and message text/captions are sent to OpenAI for each requested summary.
 Requests use `store: false`, which is not a promise of zero provider retention.
 ChatGPT plan data controls and terms apply in ChatGPT mode; separate API policies
@@ -272,8 +289,11 @@ WhatsApp connectivity, account eligibility, history availability, or real infere
 
 - **No response:** check the allowlisted group, actual mention, reply target,
   `!summarise` command, and running process.
-- **History unavailable or timed out:** keep the bot phone online, try a recent
-  starting message visible on it, and send a new command. Increasing
+- **History unavailable or timed out:** after a deployment, restart, or disconnect,
+  send new group messages while the bot is connected, then reply to one of those
+  messages with a new mentioned command. The RAM buffer starts empty and cannot
+  recover earlier messages itself; no new WhatsApp login is needed. For older or
+  evicted messages, keep the bot phone online for the best-effort fallback. Increasing
   `HISTORY_TIMEOUT_MS` may help a slow response but cannot restore missing history.
   The bot reports its specific history failure in the group and in the server log
   as `History retrieval failed: ...`. On the Google VM, inspect recent failures
@@ -308,8 +328,10 @@ WhatsApp connectivity, account eligibility, history availability, or real infere
 - **Runtime imports fail:** use Node 24+ and reinstall from the lockfile with
   `npm ci`. The Baileys package contains native dependencies, so validate the
   runtime on the deployment architecture.
-- **WhatsApp disconnected:** inspect the connection message. Restart or re-pair if
-  required; avoid simultaneous processes using the same auth directory.
+- **WhatsApp disconnected:** inspect the connection message. The incoming RAM
+  buffer is cleared to avoid treating a range spanning the interruption as complete.
+  Once reconnected, test with new messages. Restart or re-pair only if required by
+  the connection error; avoid simultaneous processes using the same auth directory.
 
 Reference docs: [Baileys](https://baileys.wiki/),
 [Baileys history sync](https://baileys.wiki/docs/socket/history-sync),

@@ -161,9 +161,17 @@ Test in the foreground:
 node --env-file=.env ../current/src/index.js
 ```
 
-From your own WhatsApp account, reply to a starting message, select the bot using
-the actual mention picker, and send `!summarise`. Keep the bot phone online for
-history requests. After the test succeeds, press Ctrl+C before creating the service.
+After the bot connects, send a few new messages in an allowed group. From your own
+WhatsApp account, reply to the first of those messages, select the bot using the
+actual mention picker, and send `!summarise`. The bot uses its temporary RAM buffer
+first; older or missing ranges use best-effort history requests to the bot phone,
+which must be online. After the test succeeds, press Ctrl+C before creating the
+service. Starting the service starts a new, empty buffer, so test it with new messages.
+
+Only allowed-group text/captions and minimal sender/boundary metadata are retained
+in RAM, for up to 24 hours and 3,000 messages per group, with a 32 MiB global cap
+that can evict messages earlier. Restart or WhatsApp disconnect clears the buffer.
+The application does not write incoming messages to disk or download media.
 
 ## 4. Keep the bot running with systemd
 
@@ -276,6 +284,10 @@ commit to `main`. Pull requests run checks only. Main releases are serialized.
 The VM installs and checks the new release before switching `current` and
 restarting the service. The workflow waits briefly for a stable systemd process;
 check the journal and a real summary after your first release.
+Every deployment restarts the process and empties the incoming RAM buffer. Send
+new group messages after it reconnects, then test a summary of those messages.
+The saved WhatsApp login remains usable; this buffer change does not require
+re-linking the bot account.
 
 ## Updates and recovery
 

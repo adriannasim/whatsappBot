@@ -161,13 +161,21 @@ setup action. These modes run to completion and exit:
 Set `OPENAI_MODEL` to an exact returned ID, or leave it blank for the first visible
 model. In `groups` mode, scan the QR using the **bot phone** → WhatsApp → Linked
 devices. Set `ALLOWED_GROUP_IDS` to the selected IDs, comma-separated. Then set
-`BOT_MODE=run` and start the server. Confirm the console reaches `Ready in ...`
-and try a quoted, mentioned `!summarise` command in an allowed group. Keep the
-bot account's primary phone online: Baileys on-demand history requests depend on
-that phone responding. Set `HISTORY_TIMEOUT_MS` in the Panel Startup settings
+`BOT_MODE=run` and start the server. Confirm the console reaches `Ready in ...`,
+send a few new messages in an allowed group, then reply to the first with a real
+bot mention and `!summarise`. The bot uses its temporary RAM buffer first. Older
+or missing ranges use best-effort history requests; keep the bot account's primary
+phone online for that fallback. Set `HISTORY_TIMEOUT_MS` in the Panel Startup settings
 from 5,000 to 120,000 milliseconds; the default is 60,000 (60 seconds). The panel
 value overrides `.env`. A longer timeout cannot recover history missing from the
 phone.
+
+The RAM buffer retains only allowed-group text/captions and minimal sender/boundary
+metadata, for up to 24 hours and 3,000 messages per group. Its 32 MiB global cap can
+evict messages earlier. The application does not write incoming messages to disk
+or download media. Deployment, server restart, or WhatsApp disconnect clears the
+buffer, so test with new messages after the next connection. The saved login stays
+in the persistent volume; re-linking WhatsApp is not needed for this buffer change.
 
 `AI_AUTH_MODE=chatgpt` uses the authorized ChatGPT plan. Optional `api-key` mode
 requires a separate billed API key in the server's private `.env`. Keep secrets

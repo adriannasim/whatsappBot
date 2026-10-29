@@ -439,7 +439,7 @@ export function createOnDemandHistory({
           }
           throw missingAnchor(pageStats.pageRows === 0 ? 'empty_page' : 'no_progress',
             pageStats.pageRows === 0
-              ? 'WhatsApp returned no earlier messages before reaching the starting message. Please try again with a new !summarise reply.'
+              ? 'WhatsApp returned no earlier messages. Reply to a newer message sent while the bot is connected, mention the bot, and send !summarise.'
               : 'WhatsApp returned history that did not move back to the starting message. Please try again with a new !summarise reply.');
         }
         cursorKey = { ...oldest.key };

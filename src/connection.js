@@ -18,10 +18,12 @@ async function loadBaileys() {
 
 const NOOP = () => {};
 
-/** One Baileys connection and private authentication state; no message archive. */
+/** One Baileys connection and private authentication state; no message disk store. */
 export function createWhatsAppConnection({
   authDir = './.baileys-auth',
   onMessages = NOOP,
+  onMessageChanges = NOOP,
+  onChatMessagesDeleted = NOOP,
   onOpen = NOOP,
   onQR = NOOP,
   onDisconnect = NOOP,
@@ -36,7 +38,7 @@ export function createWhatsAppConnection({
   reconnectMaxMs = 30_000,
 } = {}) {
   if (typeof authDir !== 'string' || !authDir.trim()) throw new TypeError('WA_AUTH_DIR must be a directory path.');
-  for (const callback of [onMessages, onOpen, onQR, onDisconnect, onFatal, log, getMessage, loadDependencies, setTimeoutImpl, clearTimeoutImpl]) {
+  for (const callback of [onMessages, onMessageChanges, onChatMessagesDeleted, onOpen, onQR, onDisconnect, onFatal, log, getMessage, loadDependencies, setTimeoutImpl, clearTimeoutImpl]) {
     if (typeof callback !== 'function') throw new TypeError('Connection callbacks must be functions.');
   }
   if (!Number.isSafeInteger(maxReconnectAttempts) || maxReconnectAttempts < 0
@@ -154,6 +156,24 @@ export function createWhatsAppConnection({
       if (!active() || event?.type !== 'notify' || event.requestId != null || !Array.isArray(event.messages)) return;
       invoke(onMessages, [event.messages], 'Could not process an incoming WhatsApp command.');
     };
+    const messageUpdates = updates => {
+      if (!active() || !Array.isArray(updates)) return;
+      // Receipt/status updates do not change text. Edits and revokes do:
+      // erase their old content instead of summarizing a stale retained copy.
+      const keys = updates.filter(item => item?.update && (
+        Object.hasOwn(item.update, 'message')
+        || item.update.messageStubType === 1 || item.update.messageStubType === 'REVOKE'
+      )).map(item => item.key).filter(Boolean);
+      if (keys.length) invoke(onMessageChanges, [keys], 'Could not clear changed message content.');
+    };
+    const messageDeletes = event => {
+      if (!active()) return;
+      if (event?.all === true && typeof event.jid === 'string') {
+        invoke(onChatMessagesDeleted, [event.jid], 'Could not clear deleted chat messages.');
+      } else if (Array.isArray(event?.keys)) {
+        invoke(onMessageChanges, [event.keys], 'Could not clear deleted message content.');
+      }
+    };
     const connection = update => {
       if (!active()) return;
       if (typeof update?.qr === 'string' && update.qr) invoke(onQR, [update.qr], 'Could not display the WhatsApp pairing QR.');
@@ -178,10 +198,14 @@ export function createWhatsAppConnection({
     };
     socket.ev.on('creds.update', credentials);
     socket.ev.on('messages.upsert', messages);
+    socket.ev.on('messages.update', messageUpdates);
+    socket.ev.on('messages.delete', messageDeletes);
     socket.ev.on('connection.update', connection);
     cleanup = () => {
       socket.ev.off('creds.update', credentials);
       socket.ev.off('messages.upsert', messages);
+      socket.ev.off('messages.update', messageUpdates);
+      socket.ev.off('messages.delete', messageDeletes);
       socket.ev.off('connection.update', connection);
     };
   }

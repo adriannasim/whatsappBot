@@ -32,7 +32,7 @@ or replying to another message:
 | --- | --- |
 | `!gm` | Good morning, a real @mention of the sender, and a short encouraging message for the day. |
 | `!gn` | Good night, a real @mention of the sender, and a short message about resting and appreciating the day's effort. |
-| `!horny` | A playful nickname, a real @mention of the sender, and one of 20 flirty lines with emojis. |
+| `!horny` | A playful nickname, a real @mention of the sender, and one of 25 flirty lines with emojis, including five water-themed replies with 💦. |
 
 These commands are case-insensitive and choose from a built-in collection of
 original phrases. They do not request chat history or use the ChatGPT allowance.

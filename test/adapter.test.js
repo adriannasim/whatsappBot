@@ -240,9 +240,9 @@ test('normalization marks greeting and flirty commands for transcript filtering'
   assert.deepEqual(rows.map(row => row.isCommand), [true, true, true, false, false]);
 });
 
-test('flirty replies draw from twenty distinct lines with emojis and mention only the sender', () => {
-  assert.equal(FLIRTY_PHRASES.length, 20);
-  assert.equal(new Set(FLIRTY_PHRASES.map(phrase => phrase.text)).size, 20);
+test('flirty replies draw from twenty-five distinct lines with emojis and mention only the sender', () => {
+  assert.equal(FLIRTY_PHRASES.length, 25);
+  assert.equal(new Set(FLIRTY_PHRASES.map(phrase => phrase.text)).size, 25);
   for (const phrase of FLIRTY_PHRASES) {
     assert.match(phrase.text, /\p{Extended_Pictographic}/u);
     assert.doesNotMatch(phrase.nickname + phrase.text, /@/);

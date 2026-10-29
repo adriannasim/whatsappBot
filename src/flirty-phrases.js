@@ -19,4 +19,9 @@ export const FLIRTY_PHRASES = Object.freeze([
   { nickname: 'showstopper', text: 'Dinner and dancing sounds promising. Add your company, and suddenly it is my favourite idea. 💃🔥' },
   { nickname: 'sexy', text: 'Looking this good and being this charming is quite the combination. I may need another coffee just to keep this conversation going. 😉😘' },
   { nickname: 'spark', text: 'No clever pickup line this time. Just a genuine compliment: spending time with you sounds wonderful. ❤️💋' },
+  { nickname: 'wave-maker', text: 'You have made quite a splash with that smile. A beach date with you sounds like the perfect next wave. 💦🌊' },
+  { nickname: 'sweet spark', text: 'Rain in the forecast? Let us find a cosy cafe and see how long we can make one coffee date last. 💦😉' },
+  { nickname: 'ocean eyes', text: 'Sea breeze, a sunset, and your favourite stories. I could get used to evenings like that with you. 💦😘' },
+  { nickname: 'daydream', text: 'A walk beside the fountain would be lovely. Your company would give me a much better reason to linger. 💦😉' },
+  { nickname: 'summer crush', text: 'Pick a spot by the water and bring that charming smile. I will bring the picnic and my best attempt at flirting. 💦🌊😉' },
 ].map((phrase) => Object.freeze(phrase)));

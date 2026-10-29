@@ -108,7 +108,9 @@ export function createSummaryService({
         return 'missing-quote';
       }
 
-      const rows = await loadMessages({ groupId, startId: quotedId, endId: id });
+      const loaded = await loadMessages({ groupId, startId: quotedId, endId: id });
+      const rows = Array.isArray(loaded) ? loaded : loaded?.messages;
+      const coverageIncomplete = !Array.isArray(loaded) && loaded?.coverageIncomplete === true;
       if (!Array.isArray(rows)) throw new Error('Invalid history result');
       const snapshot = rows
         .filter(row => row.groupId === groupId && row.id !== id)
@@ -134,6 +136,7 @@ export function createSummaryService({
         '*Chat summary*',
         rangeLabel(anchor.timestamp, command.timestamp),
         `${messages.length} message${messages.length === 1 ? '' : 's'} summarised`,
+        ...(coverageIncomplete ? ['_Some messages from an offline or recovery gap may be missing._'] : []),
       ].join('\n');
       const footer = omitted ? `\n\n_${omitted} non-text message${omitted === 1 ? '' : 's'} skipped._` : '';
 

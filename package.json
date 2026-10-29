@@ -3,7 +3,7 @@
   "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "Personal WhatsApp group summaries using a temporary message buffer and phone history",
+  "description": "Personal WhatsApp group summaries using a bounded saved message buffer and phone history",
   "engines": {
     "node": ">=24"
   },

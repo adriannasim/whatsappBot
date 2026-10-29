@@ -29,8 +29,9 @@ git status --short
 
 Review the staged paths before committing. Include the hidden `.github` directory,
 `.gitignore`, source, tests, deployment files, and lockfile. Do not stage `.env`,
-login/session folders, `node_modules`, or SSH keys. The supplied `.gitignore`
-excludes the default credential locations; custom locations need their own rules.
+login/session folders, the saved message buffer, `node_modules`, or SSH keys. The
+supplied `.gitignore` excludes the default credential locations and `data/`;
+custom locations need their own rules.
 
 Then push the first commit, using your normal GitHub sign-in:
 
@@ -89,6 +90,7 @@ the release. It does not log in or start WhatsApp. The layout is:
 ```text
 ~/apps/whatsapp-summary-bot/
   shared/           .env, node-bin, .chatgpt-auth, .baileys-auth
+    data/recent-messages/cache.json   bounded private message snapshot
   releases/<sha>/   source and dependencies for each deployed commit
   current -> releases/<sha>
   incoming/<sha>/   deployment uploads
@@ -97,6 +99,13 @@ the release. It does not log in or start WhatsApp. The layout is:
 The checkout in `~/src` is only needed for bootstrap and manual maintenance.
 Actions sends the exact tested commit for later releases; it does not run a
 moving-branch `git pull` on the running application.
+
+The service's working directory is `shared`, so the default
+`RECENT_MESSAGES_DIR=./data/recent-messages` stays outside versioned releases.
+The application creates its directory with mode `0700` and snapshot with mode
+`0600`, and replaces the snapshot atomically without retaining older versions.
+The snapshot is plaintext protected by filesystem permissions; keep the VM
+account and disk private. A custom location must also persist across releases.
 
 ## 3. Connect ChatGPT and WhatsApp
 
@@ -116,6 +125,7 @@ AI_AUTH_MODE=chatgpt
 CHATGPT_LOGIN_PORT=17778
 CHATGPT_AUTH_DIR=./.chatgpt-auth
 WA_AUTH_DIR=./.baileys-auth
+RECENT_MESSAGES_DIR=./data/recent-messages
 OPENAI_MODEL=
 ALLOWED_GROUP_IDS=
 ```
@@ -163,15 +173,26 @@ node --env-file=.env ../current/src/index.js
 
 After the bot connects, send a few new messages in an allowed group. From your own
 WhatsApp account, reply to the first of those messages, select the bot using the
-actual mention picker, and send `!summarise`. The bot uses its temporary RAM buffer
+actual mention picker, and send `!summarise`. The bot uses its bounded local buffer
 first; older or missing ranges use best-effort history requests to the bot phone,
 which must be online. After the test succeeds, press Ctrl+C before creating the
-service. Starting the service starts a new, empty buffer, so test it with new messages.
+service. The service restores unexpired messages saved by the foreground process
+when run under the same VM user, working directory, bot account, and group allowlist.
 
 Only allowed-group text/captions and minimal sender/boundary metadata are retained
-in RAM, for up to 24 hours and 3,000 messages per group, with a 32 MiB global cap
-that can evict messages earlier. Restart or WhatsApp disconnect clears the buffer.
-The application does not write incoming messages to disk or download media.
+in memory and the private snapshot, for up to 24 hours and 3,000 messages per group,
+with a 32 MiB global retained-content cap that can evict messages earlier. Messages
+keep their original expiry after restore. Cleanup runs on restore and every minute
+while the bot runs; expired saved messages cannot be used after a long shutdown.
+The application does not download media.
+
+Restart or WhatsApp disconnect preserves the buffer and marks a recovery gap.
+Missed messages WhatsApp delivers after reconnection are merged using exact
+message keys and timestamps, without running old commands. Recovery remains best
+effort: the phone may still return an empty history response. A request spanning
+a gap attempts phone-history retrieval, then can summarise the retained subset
+with an explicit missing-messages warning if the exact starting message exists.
+A missing starting message still fails instead of substituting a different range.
 
 ## 4. Keep the bot running with systemd
 
@@ -284,10 +305,11 @@ commit to `main`. Pull requests run checks only. Main releases are serialized.
 The VM installs and checks the new release before switching `current` and
 restarting the service. The workflow waits briefly for a stable systemd process;
 check the journal and a real summary after your first release.
-Every deployment restarts the process and empties the incoming RAM buffer. Send
-new group messages after it reconnects, then test a summary of those messages.
-The saved WhatsApp login remains usable; this buffer change does not require
-re-linking the bot account.
+Every deployment restarts the process, then restores its unexpired saved buffer
+from `shared`. The first upgrade from the RAM-only version cannot export messages
+held by the old process; send fresh messages after that one-time upgrade. Later
+deployments preserve saved messages within their original limits. The saved
+WhatsApp login remains usable; this change does not require re-linking the bot.
 
 ## Updates and recovery
 
@@ -296,8 +318,10 @@ re-linking the bot account.
 - Pause deployment by setting `GOOGLE_VM_DEPLOY_ENABLED=false` before stopping the
   service for login/logout, configuration changes, or session maintenance. Run any
   maintenance CLI from `shared`, then restart the service and re-enable deployment.
-- Back up `shared` privately. Deployments preserve it, but deleting the VM or disk
-  does not. New code still runs with access to these credentials.
+- Back up credentials in `shared` privately. Deployments preserve `shared`, but
+  deleting the VM or disk does not. Exclude `data/recent-messages` (or the custom
+  `RECENT_MESSAGES_DIR`) from long-lived backups to avoid retaining message text
+  beyond its intended lifetime. New code can access these credentials and messages.
 - Failed installation/import checks leave `current` and the existing service
   alone. A failure after switching/restarting can leave the bot unavailable; no
   automatic rollback is attempted. Previous releases remain available for diagnosis.

@@ -20,6 +20,8 @@ test('remote login uses a valid port and Baileys history requests have a bounded
   const read = env => readConfig(env, { operation: 'login' });
   assert.equal(read({}).loginPort, 0);
   assert.equal(read({}).whatsappAuthDir, './.baileys-auth');
+  assert.equal(read({}).recentMessagesDir, './data/recent-messages');
+  assert.equal(read({ RECENT_MESSAGES_DIR: './private-cache' }).recentMessagesDir, './private-cache');
   assert.equal(read({}).historyTimeoutMs, 60000);
   assert.equal(read({ CHATGPT_LOGIN_PORT: '17778' }).loginPort, 17778);
   assert.equal(read({ WA_AUTH_DIR: './session', HISTORY_TIMEOUT_MS: '45000' }).whatsappAuthDir, './session');

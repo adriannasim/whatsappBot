@@ -3,15 +3,23 @@ import { readConfig } from './config.js';
 import { prepareAI } from './ai.js';
 import { createWhatsAppConnection } from './connection.js';
 import { createWhatsAppBot } from './bot.js';
+import { openRecentMessageStore } from './recent-store.js';
 
 process.umask(0o077);
 const clean = value => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
 const listGroups = process.argv.includes('--list-groups');
 let config;
 let ai;
+let recentStore;
+let savedRecent;
 try {
   config = readConfig(process.env, { listGroups });
   if (!listGroups) {
+    recentStore = await openRecentMessageStore({
+      directory: config.recentMessagesDir,
+      onWarning: message => console.error(clean(message)),
+    });
+    savedRecent = await recentStore.load();
     ai = await prepareAI(config);
     console.log(`Summary model: ${clean(ai.model.id)}`);
     if (config.authMode === 'chatgpt') {
@@ -32,7 +40,7 @@ let connection;
 async function stop(exitCode = 0) {
   if (stopping) return;
   stopping = true;
-  bot?.close();
+  await bot?.close();
   try { await connection?.stop(); } catch { /* Transport may already be closed. */ }
   process.exit(exitCode);
 }
@@ -56,14 +64,16 @@ connection = createWhatsAppConnection({
   },
   getMessage: key => bot?.getMessage(key),
   onMessages: messages => bot?.handleMessages(messages),
+  onReplayMessages: messages => bot?.handleReplayMessages(messages),
   onMessageChanges: keys => bot?.invalidateMessages(keys),
   onChatMessagesDeleted: groupId => bot?.discardGroup(groupId),
-  onDisconnect: () => bot?.clearRecentMessages(),
+  onDisconnect: () => bot?.markDisconnected(),
   onOpen: async socket => {
     if (stopping) return;
     if (!listGroups) {
+      bot?.onConnected();
       console.log(`Ready in ${config.groupIds.size} selected group(s). Waiting for @mention !summarise replies.`);
-      console.log('Temporary message buffer: up to 24 hours and 3000 messages per selected group, within a 32 MiB total limit. Empty after restart or disconnect.');
+      console.log('Private recent-message cache: up to 24 hours and 3000 messages per selected group. Saved messages survive restarts; missed-message recovery is best-effort.');
       return;
     }
     try {
@@ -87,12 +97,15 @@ connection = createWhatsAppConnection({
 if (!listGroups) {
   bot = createWhatsAppBot({
     config,
+    recentStore,
+    savedRecent,
     summarize: ai.summarize,
     getSocket: () => connection.getSocket(),
     getOwnIds: () => connection.getOwnIds(),
     onError: message => console.error(message),
     onPause: () => console.error('Summaries paused: ChatGPT plan limit reached. Check https://chatgpt.com/settings/usage and restart the bot after access is restored.'),
   });
+  savedRecent = undefined;
 }
 
 process.on('SIGINT', () => { void stop(); });

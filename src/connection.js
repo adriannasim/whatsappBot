@@ -18,10 +18,11 @@ async function loadBaileys() {
 
 const NOOP = () => {};
 
-/** One Baileys connection and private authentication state; no message disk store. */
+/** One Baileys connection, with live and recovered messages routed separately. */
 export function createWhatsAppConnection({
   authDir = './.baileys-auth',
   onMessages = NOOP,
+  onReplayMessages = NOOP,
   onMessageChanges = NOOP,
   onChatMessagesDeleted = NOOP,
   onOpen = NOOP,
@@ -38,7 +39,7 @@ export function createWhatsAppConnection({
   reconnectMaxMs = 30_000,
 } = {}) {
   if (typeof authDir !== 'string' || !authDir.trim()) throw new TypeError('WA_AUTH_DIR must be a directory path.');
-  for (const callback of [onMessages, onMessageChanges, onChatMessagesDeleted, onOpen, onQR, onDisconnect, onFatal, log, getMessage, loadDependencies, setTimeoutImpl, clearTimeoutImpl]) {
+  for (const callback of [onMessages, onReplayMessages, onMessageChanges, onChatMessagesDeleted, onOpen, onQR, onDisconnect, onFatal, log, getMessage, loadDependencies, setTimeoutImpl, clearTimeoutImpl]) {
     if (typeof callback !== 'function') throw new TypeError('Connection callbacks must be functions.');
   }
   if (!Number.isSafeInteger(maxReconnectAttempts) || maxReconnectAttempts < 0
@@ -153,8 +154,12 @@ export function createWhatsAppConnection({
 
     const credentials = () => { if (active()) queueCredentialSave(); };
     const messages = event => {
-      if (!active() || event?.type !== 'notify' || event.requestId != null || !Array.isArray(event.messages)) return;
-      invoke(onMessages, [event.messages], 'Could not process an incoming WhatsApp command.');
+      if (!active() || !Array.isArray(event?.messages)) return;
+      if (event.type === 'append' || (event.type === 'notify' && event.requestId != null)) {
+        invoke(onReplayMessages, [event.messages], 'Could not collect recovered WhatsApp messages.');
+      } else if (event.type === 'notify') {
+        invoke(onMessages, [event.messages], 'Could not process an incoming WhatsApp command.');
+      }
     };
     const messageUpdates = updates => {
       if (!active() || !Array.isArray(updates)) return;

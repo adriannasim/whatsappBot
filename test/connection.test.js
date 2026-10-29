@@ -19,6 +19,7 @@ async function fixture(t, options = {}) {
   const configs = [];
   const timerJobs = new Map();
   const received = [];
+  const replayed = [];
   const opened = [];
   const qrs = [];
   const errors = [];
@@ -57,6 +58,7 @@ async function fixture(t, options = {}) {
   const connection = createWhatsAppConnection({
     authDir,
     onMessages: values => received.push(values),
+    onReplayMessages: values => replayed.push(values),
     onOpen: socket => opened.push(socket),
     onQR: qr => qrs.push(qr),
     onDisconnect: () => { disconnects++; },
@@ -69,7 +71,7 @@ async function fixture(t, options = {}) {
   });
   t.after(() => connection.stop());
   return {
-    authDir, state, fake, connection, sockets, configs, timerJobs, received, opened, qrs, errors, logs,
+    authDir, state, fake, connection, sockets, configs, timerJobs, received, replayed, opened, qrs, errors, logs,
     counts: () => ({ disconnects, authLoads, saves }),
     async fireTimer() {
       const [id, job] = timerJobs.entries().next().value;
@@ -106,7 +108,7 @@ test('opens one private auth state with no full history or recent-message cache'
   assert.equal(await config.getMessage({}), undefined);
 });
 
-test('only live notify events reach the command handler; replay and history events are ignored', async t => {
+test('live commands and recovered messages are routed separately; history events are ignored', async t => {
   const f = await fixture(t);
   await f.connection.start();
   const message = { key: { id: 'command' } };
@@ -117,6 +119,7 @@ test('only live notify events reach the command handler; replay and history even
   events.emit('messages.upsert', { type: 'notify', messages: null });
   events.emit('messages.upsert', { type: 'notify', messages: [message] });
   assert.deepEqual(f.received, [[message]]);
+  assert.deepEqual(f.replayed, [[message], [message]]);
 });
 
 test('temporary disconnections reconnect with capped backoff and discard old socket listeners', async t => {

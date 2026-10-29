@@ -29,6 +29,7 @@ export function readConfig(env = process.env, { listGroups = false, operation = 
   return {
     groupIds, maxMessages, authMode, loginPort, historyTimeoutMs,
     whatsappAuthDir: env.WA_AUTH_DIR?.trim() || './.baileys-auth',
+    recentMessagesDir: env.RECENT_MESSAGES_DIR?.trim() || './data/recent-messages',
     authDir: env.CHATGPT_AUTH_DIR?.trim() || './.chatgpt-auth',
     // A leftover API key is never passed to the subscription-backed path.
     apiKey: authMode === 'api-key' ? env.OPENAI_API_KEY?.trim() : undefined,

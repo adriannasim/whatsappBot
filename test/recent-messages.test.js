@@ -191,3 +191,128 @@ test('invalid configuration fails before retaining messages', () => {
     assert.throws(() => createRecentMessageBuffer(options), TypeError);
   }
 });
+
+test('snapshot restore preserves known ranges and starts new live coverage without clearing old rows', () => {
+  const original = fixture().buffer;
+  original.add(['anchor', 'middle', 'old-command'].map(id => message(id)));
+  const saved = JSON.parse(JSON.stringify(original.snapshot()));
+  const { buffer } = fixture();
+  buffer.restore(saved);
+  assert.deepEqual(ids(buffer.load(request('anchor', message('old-command')))), ['anchor', 'middle']);
+  buffer.markGap();
+  buffer.markGap();
+  buffer.add([message('new'), message('command')]);
+  assert.equal(buffer.load(request()), null);
+  const available = buffer.loadAvailable(request());
+  assert.deepEqual(ids(available.messages), ['anchor', 'middle', 'old-command', 'new']);
+  assert.equal(available.gapCount, 1);
+  assert.equal(buffer.has(message('old-command').key), true);
+  assert.equal(buffer.has({ ...message('old-command').key, fromMe: true }), false);
+  assert.deepEqual(buffer.checkpoint(GROUP), { key: { ...message('command').key, participant: PERSON, participantAlt: '456@lid' }, messageTimestamp: SECONDS });
+  const detached = buffer.snapshot();
+  detached.entries[0].row.message.conversation = 'mutated snapshot';
+  assert.equal(extractContent(buffer.loadAvailable(request()).messages[0]).text, 'Text anchor');
+});
+
+test('restore and offline duplicates never renew original expiry or resurrect tombstones', () => {
+  let clock = SECONDS * 1000 + 100;
+  const options = { groupIds: [GROUP], now: () => clock, ttlMs: 1000 };
+  const original = createRecentMessageBuffer(options);
+  original.add([message('anchor'), message('middle'), message('command')]);
+  original.invalidate([message('middle').key]);
+  const saved = original.snapshot();
+  clock += 500;
+  const restored = createRecentMessageBuffer(options);
+  restored.restore(saved);
+  restored.addReplay([message('anchor'), message('middle')]);
+  const rows = restored.load(request());
+  assert.deepEqual(ids(rows), ['anchor', 'middle']);
+  assert.equal(extractContent(rows[1]).deleted, true);
+  assert.equal(extractContent(rows[1]).text, '');
+  assert.deepEqual(restored.snapshot().entries.map(entry => entry.expiresAt), saved.entries.map(entry => entry.expiresAt));
+  clock += 400;
+  restored.prune();
+  assert.equal(restored.has(message('anchor').key), false);
+  assert.equal(restored.loadAvailable(request()), null);
+  assert.deepEqual(restored.snapshot().entries, []);
+});
+
+test('offline replay accepts out-of-order rows without claiming that an interruption is fully recovered', () => {
+  const { buffer } = fixture();
+  const at = (id, offset) => message(id, { messageTimestamp: SECONDS + offset });
+  buffer.add([at('anchor', 0), at('last-old', 1)]);
+  buffer.markGap();
+  buffer.add([at('first-new', 8), at('command', 10), at('later', 11)]);
+  buffer.addReplay([at('offline-late', 7), at('offline-early', 2), at('anchor', 0)]);
+  assert.equal(buffer.load(request('anchor', at('command', 10))), null);
+  const result = buffer.loadAvailable(request('anchor', at('command', 10)));
+  assert.deepEqual(ids(result.messages), ['anchor', 'last-old', 'offline-early', 'offline-late', 'first-new']);
+  assert.ok(result.gapCount > 0);
+  assert.equal(buffer.checkpoint(GROUP).key.id, 'later');
+  assert.equal(buffer.has(at('offline-early', 2).key), true);
+});
+
+test('available ranges exclude uncertain same-second replay rows at both boundaries', () => {
+  const { buffer } = fixture();
+  const at = (id, offset) => message(id, { messageTimestamp: SECONDS + offset });
+  buffer.add([at('before', 0), at('anchor', 0), at('known-start-second', 0)]);
+  buffer.markGap();
+  buffer.add([at('known-end-second', 2), at('command', 2), at('later', 2)]);
+  buffer.addReplay([at('uncertain-start', 0), at('inside', 1), at('uncertain-end', 2)]);
+  const wanted = request('anchor', at('command', 2));
+  assert.deepEqual(ids(buffer.loadAvailable(wanted).messages), ['anchor', 'known-start-second', 'inside', 'known-end-second']);
+  assert.equal(buffer.loadAvailable({ ...wanted, startParticipant: '999@lid' }), null);
+  assert.equal(buffer.loadAvailable({ ...wanted, startId: 'missing' }), null);
+  assert.equal(buffer.loadAvailable({ ...wanted, endKey: { ...wanted.endKey, participant: '999@lid', participantAlt: undefined } }), null);
+});
+
+test('a late replay row inside a previously complete stretch invalidates its completeness claim', () => {
+  const { buffer } = fixture();
+  const end = message('command', { messageTimestamp: SECONDS + 2 });
+  buffer.add([message('anchor'), end]);
+  assert.deepEqual(ids(buffer.load(request('anchor', end))), ['anchor']);
+  buffer.addReplay([message('missed', { messageTimestamp: SECONDS + 1 })]);
+  assert.equal(buffer.load(request('anchor', end)), null);
+  assert.deepEqual(ids(buffer.loadAvailable(request('anchor', end)).messages), ['anchor', 'missed']);
+  const restored = fixture().buffer;
+  restored.restore(buffer.snapshot());
+  assert.equal(restored.load(request('anchor', end)), null);
+  assert.ok(restored.loadAvailable(request('anchor', end)).gapCount > 0);
+});
+
+test('restore enforces current group and count limits and expiry while preserving sender checks', () => {
+  const original = fixture().buffer;
+  original.add(['anchor', 'next', 'middle', 'command'].map(id => message(id)));
+  const other = id => message(id, { key: { ...message(id).key, remoteJid: OTHER } });
+  original.add([other('other-anchor'), other('other-command')]);
+  const { buffer } = fixture({ groupIds: [GROUP], maxMessagesPerGroup: 3 });
+  buffer.restore(original.snapshot());
+  assert.equal(buffer.has(other('other-anchor').key), false);
+  assert.equal(buffer.load(request()), null);
+  assert.deepEqual(ids(buffer.load(request('next'))), ['next', 'middle']);
+  assert.equal(buffer.load(request('next', message('command'), { startFromMe: true })), null);
+});
+
+test('malformed, oversized or unsafe snapshots fail closed as a whole without exposing payloads', () => {
+  const original = fixture().buffer;
+  original.add([message('anchor'), message('command')]);
+  const good = original.snapshot();
+  const cases = [
+    saved => { saved.version = 99; },
+    saved => { saved.entries[1].sequence = saved.entries[0].sequence; },
+    saved => { saved.entries[0].segment = 0; },
+    saved => { saved.entries[0].row.message.imageMessage = { mediaKey: 'secret' }; },
+    saved => { saved.entries[0].row.key.participant = 'bad jid'; },
+    saved => { saved.entries[0].expiresAt = Infinity; },
+    saved => { saved.entries[0].row.message.conversation = 'x'.repeat(5000); },
+    saved => { saved.entries[1].row.messageTimestamp = SECONDS - 1; },
+  ];
+  for (const change of cases) {
+    const saved = structuredClone(good);
+    change(saved);
+    const { buffer } = fixture({ maxBytes: 3000 });
+    buffer.add([message('prior'), message('prior-command')]);
+    assert.throws(() => buffer.restore(saved), { message: 'Invalid recent-message snapshot.' });
+    assert.deepEqual(buffer.snapshot().entries, []);
+  }
+});

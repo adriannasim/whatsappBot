@@ -13,9 +13,11 @@ Push main → dependency/runtime checks and tests → publish GHCR image → pre
 
 Code and locked dependencies live in the image at `/opt/bot`. Pterodactyl mounts
 persistent server data at `/home/container`, containing `.env`, `.chatgpt-auth`,
-and `.baileys-auth` (or your configured `WA_AUTH_DIR`). Deployments replace the image and preserve
-that volume. Back up the volume securely; do not commit it or put it in Actions
-artifacts. Panel environment values override values in `.env`.
+`.baileys-auth` (or your configured `WA_AUTH_DIR`), and the bounded message buffer
+at `data/recent-messages/cache.json`. Deployments replace the image and preserve
+that volume. Back up credentials securely, but exclude the message buffer from
+long-lived backups to preserve its intended retention limit. Do not commit the
+volume or put it in Actions artifacts. Panel environment values override `.env`.
 
 ## 1. Push the source to GitHub
 
@@ -23,8 +25,9 @@ Create a repository and push this project, including hidden files such as
 `.github`, `.dockerignore`, and `.gitignore`. Use a private repository if desired.
 Commit `package-lock.json` so image builds use the same dependency versions.
 Before pushing, review `git status`: `.env`, credentials, WhatsApp session files,
-`node_modules`, and ZIP archives must be excluded. Custom `CHATGPT_AUTH_DIR` and
-`WA_AUTH_DIR` locations need matching ignore rules if they are inside the repository.
+the saved message buffer, `node_modules`, and ZIP archives must be excluded.
+Custom `CHATGPT_AUTH_DIR`, `WA_AUTH_DIR`, and `RECENT_MESSAGES_DIR` locations need
+matching ignore rules if they are inside the repository; default `data/` is ignored.
 
 In GitHub, open Settings → Secrets and variables → Actions → Variables and set:
 
@@ -58,7 +61,8 @@ credential; do not copy the Actions publishing token to Wings. See the
    real image name from step 1. Keep that same image selected on the server.
 3. Create the server with this egg. About 1–2 GB RAM is a reasonable starting
    allocation for modest group traffic; monitor your actual load and adjust it.
-   Keep enough persistent disk for authentication state and logs. Pterodactyl may
+   Keep enough persistent disk for authentication state, the message buffer, and
+   logs. Pterodactyl may
    require a primary allocation; the normal bot does not expose a public port.
 4. Keep `BOT_MODE=check`, `WA_AUTH_DIR=./.baileys-auth`, and `EXPECTED_REVISION`
    blank for bootstrap. Start the server and inspect its console.
@@ -163,19 +167,36 @@ model. In `groups` mode, scan the QR using the **bot phone** → WhatsApp → Li
 devices. Set `ALLOWED_GROUP_IDS` to the selected IDs, comma-separated. Then set
 `BOT_MODE=run` and start the server. Confirm the console reaches `Ready in ...`,
 send a few new messages in an allowed group, then reply to the first with a real
-bot mention and `!summarise`. The bot uses its temporary RAM buffer first. Older
+bot mention and `!summarise`. The bot uses its bounded local buffer first. Older
 or missing ranges use best-effort history requests; keep the bot account's primary
 phone online for that fallback. Set `HISTORY_TIMEOUT_MS` in the Panel Startup settings
 from 5,000 to 120,000 milliseconds; the default is 60,000 (60 seconds). The panel
 value overrides `.env`. A longer timeout cannot recover history missing from the
 phone.
 
-The RAM buffer retains only allowed-group text/captions and minimal sender/boundary
-metadata, for up to 24 hours and 3,000 messages per group. Its 32 MiB global cap can
-evict messages earlier. The application does not write incoming messages to disk
-or download media. Deployment, server restart, or WhatsApp disconnect clears the
-buffer, so test with new messages after the next connection. The saved login stays
-in the persistent volume; re-linking WhatsApp is not needed for this buffer change.
+The buffer retains only allowed-group text/captions and minimal sender/boundary
+metadata, for up to 24 hours and 3,000 messages per group. Its 32 MiB global
+retained-content cap can evict messages earlier. The application saves it privately
+under `RECENT_MESSAGES_DIR`, defaulting to `./data/recent-messages` relative to
+`/home/container`, and does not download media. Set a custom directory in `.env`
+only if it remains in the persistent volume and is private. The directory is mode
+`0700` and `cache.json` is mode `0600`; updates replace it atomically without
+keeping older versions. The snapshot is plaintext protected by filesystem permissions.
+
+Deployment, server restart, and WhatsApp disconnect preserve unexpired saved
+messages for the same bot account and current group allowlist. Restoration keeps
+the original expiry; cleanup runs on restore and every minute while the bot runs.
+Expired saved messages cannot be used after a long shutdown. The first upgrade
+from RAM-only storage cannot carry over the old process's messages, so test with
+fresh messages after that one-time upgrade. Subsequent restarts restore the saved
+buffer. Re-linking WhatsApp is not needed for this change.
+
+Missed messages delivered after reconnecting are merged using exact message keys
+and timestamps without executing old commands. A range crossing a connection gap
+first attempts phone-history recovery, which can still return empty. If its exact
+starting message is retained, the bot can summarise the known subset with an
+explicit missing-messages warning. If the starting message is absent, it asks for
+a newer start or retry; it does not silently change the requested range.
 
 `AI_AUTH_MODE=chatgpt` uses the authorized ChatGPT plan. Optional `api-key` mode
 requires a separate billed API key in the server's private `.env`. Keep secrets
@@ -236,8 +257,9 @@ retried, and failed deployment does not automatically roll back.
   immutable image in the egg/server, and set its matching `EXPECTED_REVISION`.
   Restore the `:production` image selection before enabling CD again.
 - After a ChatGPT plan-limit pause, restore access and restart the bot.
-- Deleting/reinstalling a server or deleting its volume can erase login sessions.
-  Image replacement alone preserves them; do not use reinstall as a deploy step.
+- Deleting/reinstalling a server or deleting its volume can erase login sessions
+  and the saved buffer. Image replacement alone preserves them; do not use
+  reinstall as a deploy step.
 - The image entrypoint accepts only the documented `BOT_MODE` values. Changing
   the displayed `STARTUP` command does not execute arbitrary shell commands.
 - Run one active instance for a WhatsApp session and one credential owner per

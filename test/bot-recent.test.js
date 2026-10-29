@@ -55,7 +55,7 @@ test('fresh live conversation summarises from RAM without a phone history reques
   assert.deepEqual(f.calls.ai[0].map(r => [r.id, r.text, r.sender]), [
     ['anchor', 'I arrived home.', 'Alice'], ['dinner', 'Dinner was salad.', 'Alice'],
   ]);
-  assert.match(f.calls.replies[0], /Summary of 2 available messages/);
+  assert.match(f.calls.replies[0], /2 messages summarised/);
   assert.equal(f.calls.diagnostics[0], 'History diagnostic: {"reason":"recent_buffer","retained":2}');
   assert.equal(await f.bot.getMessage(first.key), undefined);
 });
@@ -74,7 +74,7 @@ test('records one whole batch before command handling and excludes bot, commands
   await f.bot.handleMessages(rows);
   assert.equal(f.calls.history.length, 0);
   assert.deepEqual(f.calls.ai[0].map(r => r.id), ['anchor', 'caption']);
-  assert.match(f.calls.replies[0], /Omitted 2 non-text messages/);
+  assert.match(f.calls.replies[0], /2 non-text messages skipped/);
 });
 
 test('missing or mismatched anchor falls back and never summarises a partial buffer', async t => {

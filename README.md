@@ -13,6 +13,17 @@ range is unavailable locally, it requests available history from the bot phone.
 It replies in the same group. Messages after the command and the bot's previous
 replies are excluded.
 
+Replies show a compact heading, the date/time range in Malaysia time (MYT), and
+the message count, followed by one bullet per topic with WhatsApp bold labels.
+For example, when supported by the conversation:
+
+```text
+- *Bot test:* Adrianna tested the WhatsApp bot.
+- *Dinner:* Subway salad for dinner.
+```
+
+Decisions, action items, and open questions get separate headings only when useful.
+
 WhatsApp connectivity uses [Baileys](https://baileys.wiki/), directly from Node.js.
 No Chrome installation or browser process is needed for WhatsApp. The default AI
 mode uses **Continue with ChatGPT**, with a model you can choose in `.env`, through

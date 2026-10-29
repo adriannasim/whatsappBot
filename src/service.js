@@ -26,8 +26,27 @@ function splitReply(text) {
   return chunks;
 }
 
-function iso(timestamp) {
-  return new Date(timestamp * 1000).toISOString();
+const malaysiaDateTime = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Kuala_Lumpur', day: 'numeric', month: 'short', year: 'numeric',
+  hour: 'numeric', minute: '2-digit', hour12: true,
+});
+
+function localTime(timestamp) {
+  const parts = Object.fromEntries(malaysiaDateTime.formatToParts(new Date(timestamp * 1000))
+    .filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+  return { date: `${parts.day} ${parts.month} ${parts.year}`, clock: `${parts.hour}:${parts.minute}`, period: parts.dayPeriod.toLowerCase() };
+}
+
+function rangeLabel(startTimestamp, endTimestamp) {
+  const start = localTime(startTimestamp);
+  const end = localTime(endTimestamp);
+  const endTime = `${end.clock} ${end.period}`;
+  if (start.date !== end.date) {
+    return `${start.date}, ${start.clock} ${start.period}\n→ ${end.date}, ${endTime} MYT`;
+  }
+  const startTime = `${start.clock}${start.period === end.period ? '' : ` ${start.period}`}`;
+  const range = start.clock === end.clock && start.period === end.period ? endTime : `${startTime}–${endTime}`;
+  return `${start.date} · ${range} MYT`;
 }
 
 /**
@@ -112,11 +131,11 @@ export function createSummaryService({
 
       const omitted = eligible.length - messages.length;
       const header = [
-        `Summary of ${messages.length} available messages`,
-        `${iso(anchor.timestamp)} → ${iso(command.timestamp)} (command time)`,
-        'Available text and captions only.',
-        ...(omitted ? [`Omitted ${omitted} non-text message${omitted === 1 ? '' : 's'}.`] : []),
+        '*Chat summary*',
+        rangeLabel(anchor.timestamp, command.timestamp),
+        `${messages.length} message${messages.length === 1 ? '' : 's'} summarised`,
       ].join('\n');
+      const footer = omitted ? `\n\n_${omitted} non-text message${omitted === 1 ? '' : 's'} skipped._` : '';
 
       // Another group may have exhausted the shared allowance during this fetch.
       if (planPaused) {
@@ -125,7 +144,7 @@ export function createSummaryService({
       }
       const summary = await summarize(messages);
       if (typeof summary !== 'string' || !summary.trim()) throw new Error('Empty summary');
-      for (const chunk of splitReply(`${header}\n\n${summary.trim()}`)) {
+      for (const chunk of splitReply(`${header}\n\n${summary.trim()}${footer}`)) {
         await reply(groupId, id, chunk);
       }
       lastSuccess.set(groupId, now());

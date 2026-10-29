@@ -148,9 +148,9 @@ test('passes the exact command cursor and includes the anchor while filtering un
   assert.equal(reply.options.quoted, incoming);
   assert.deepEqual(reply.content.mentions, []);
   assert.equal(reply.content.linkPreview, null);
-  assert.match(reply.content.text, /Summary of 2 available messages/);
-  assert.match(reply.content.text, /Omitted 2 non-text messages/);
-  assert.match(reply.content.text, /2027-01-15T08:00:00.000Z → 2027-01-15T08:01:00.000Z/);
+  assert.match(reply.content.text, /2 messages summarised/);
+  assert.match(reply.content.text, /2 non-text messages skipped/);
+  assert.match(reply.content.text, /15 Jan 2027 · 4:00–4:01 pm MYT/);
 });
 
 test('a missing or cross-group quote requests a starting message without loading history', async t => {

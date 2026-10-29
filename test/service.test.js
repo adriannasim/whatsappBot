@@ -84,10 +84,8 @@ test('fetches once on demand and summarises only selected text and captions', as
   assert.deepEqual(f.loads, [{ groupId: 'friends@g.us', startId: 'anchor', endId: 'command-1' }]);
   assert.deepEqual(f.inputs[0].map(item => item.id), ['anchor', 'caption']);
   assert.equal(f.inputs[0][1].text, 'dinner at six');
-  assert.match(f.replies[0].text, /Summary of 2 available messages/);
-  assert.match(f.replies[0].text, /Available text and captions only\./);
-  assert.match(f.replies[0].text, /Omitted 1 non-text message\./);
-  assert.match(f.replies[0].text, /2027-01-15T08:00:00.000Z/);
+  assert.ok(f.replies[0].text.startsWith('*Chat summary*\n15 Jan 2027 · 4:00–4:01 pm MYT\n2 messages summarised\n\n'));
+  assert.ok(f.replies[0].text.endsWith('\n\n_1 non-text message skipped._'));
   assert.equal(f.replies[0].id, 'command-1');
   assert.equal(f.replies[0].groupId, 'friends@g.us');
   assert.doesNotMatch(f.replies[0].text, /@g\.us|bot-summary|previous-command|restarted|saved/);

@@ -25,6 +25,19 @@ For example, when supported by the conversation:
 
 Decisions, action items, and open questions get separate headings only when useful.
 
+You can also send these commands in any selected group without mentioning the bot
+or replying to another message:
+
+| Command | Reply |
+| --- | --- |
+| `!gm` | Good morning, a real @mention of the sender, and a short encouraging message for the day. |
+| `!gn` | Good night, a real @mention of the sender, and a short message about resting and appreciating the day's effort. |
+
+Both commands are case-insensitive and choose from a built-in collection of
+original phrases. They do not request chat history or use the ChatGPT allowance.
+Greeting commands and the bot's replies are excluded from summaries. Replayed
+commands after a reconnect or restart do not trigger another greeting.
+
 WhatsApp connectivity uses [Baileys](https://baileys.wiki/), directly from Node.js.
 No Chrome installation or browser process is needed for WhatsApp. The default AI
 mode uses **Continue with ChatGPT**, with a model you can choose in `.env`, through

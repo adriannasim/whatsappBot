@@ -3,11 +3,13 @@ import { createOnDemandHistory } from './history.js';
 import { HistoryUnavailableError } from './history-error.js';
 import { createRecentMessageBuffer } from './recent-messages.js';
 import { createSummaryService } from './service.js';
+import { createGreeting } from './greetings.js';
 
 const keyFor = (groupId, id) => JSON.stringify([groupId, id]);
 const RETRY_TTL_MS = 5 * 60 * 1000;
 const MAX_RETRY_MESSAGES = 50;
 const MAX_ACTIVE_COMMANDS = 64;
+const actionable = context => context && (context.kind === 'gm' || context.kind === 'gn' || context.mentioned);
 
 /** Summarize bounded saved ranges, with best-effort phone recovery for gaps. */
 export function createWhatsAppBot({
@@ -105,8 +107,24 @@ export function createWhatsAppBot({
   const expiryTimer = setInterval(() => { pruneOutgoing(); recent.prune(); void persist(); }, 60_000);
   expiryTimer.unref?.();
 
+  async function reply(groupId, commandId, text, mentions = []) {
+    const context = activeCommands.get(keyFor(groupId, commandId));
+    const socket = getSocket();
+    if (closed || !context || !socket || context.socket !== socket) throw new Error('Connection changed');
+    const sent = await socket.sendMessage(
+      groupId,
+      { text, mentions, linkPreview: null },
+      { quoted: context.raw },
+    );
+    if (!closed && sent?.key?.id && sent.message) {
+      pruneOutgoing();
+      if (outgoing.size >= MAX_RETRY_MESSAGES) outgoing.delete(outgoing.keys().next().value);
+      outgoing.set(keyFor(groupId, sent.key.id), { message: sent.message, createdAt: now() });
+    }
+  }
+
   const handle = createSummaryService({
-    summarize, onPause, onError, now,
+    summarize, onPause, onError, now, reply,
     loadMessages: async ({ groupId, startId, endId }) => {
       const context = activeCommands.get(keyFor(groupId, endId));
       if (closed || !context || context.socket !== getSocket()) throw new Error('Connection changed');
@@ -153,27 +171,12 @@ export function createWhatsAppBot({
       const normalized = normalizeMessages(messages, groupId, { ownIds });
       return coverageIncomplete ? { messages: normalized, coverageIncomplete: true } : normalized;
     },
-    reply: async (groupId, commandId, text) => {
-      const context = activeCommands.get(keyFor(groupId, commandId));
-      const socket = getSocket();
-      if (closed || !context || !socket || context.socket !== socket) throw new Error('Connection changed');
-      const sent = await socket.sendMessage(
-        groupId,
-        { text, mentions: [], linkPreview: null },
-        { quoted: context.raw },
-      );
-      if (!closed && sent?.key?.id && sent.message) {
-        pruneOutgoing();
-        if (outgoing.size >= MAX_RETRY_MESSAGES) outgoing.delete(outgoing.keys().next().value);
-        outgoing.set(keyFor(groupId, sent.key.id), { message: sent.message, createdAt: now() });
-      }
-    },
   });
 
   async function handleOne(raw) {
     if (closed || !config.groupIds.has(raw?.key?.remoteJid)) return 'ignored';
     const context = getIncomingCommand(raw, getOwnIds());
-    if (!context?.mentioned) return 'ignored';
+    if (!actionable(context)) return 'ignored';
     // Old replayed commands must never spend another AI request on reconnect.
     if (context.command.timestamp < commandEpoch) return 'ignored';
     const key = keyFor(context.command.groupId, context.command.id);
@@ -183,9 +186,14 @@ export function createWhatsAppBot({
     if (!context.socket) return 'disconnected';
     activeCommands.set(key, context);
     try {
+      if (context.kind === 'gm' || context.kind === 'gn') {
+        const greeting = createGreeting(context.kind, context.senderJid);
+        await reply(context.command.groupId, context.command.id, greeting.text, greeting.mentions);
+        return 'greeted';
+      }
       return await handle(context);
     } catch {
-      try { onError('Could not process or deliver a summary. Check the connection, then send a new command.'); }
+      try { onError('Could not process or deliver a bot reply. Check the connection, then send a new command.'); }
       catch { /* Logging cannot retain the active command. */ }
       return 'failed';
     } finally {
@@ -207,7 +215,7 @@ export function createWhatsAppBot({
         if (messages.some(raw => config.groupIds.has(raw?.key?.remoteJid))) void persist();
       }
       return Promise.all(messages.map(raw => duplicateIds.has(keyFor(raw?.key?.remoteJid, raw?.key?.id))
-        && getIncomingCommand(raw, getOwnIds())?.mentioned ? 'duplicate' : handleOne(raw)));
+        && actionable(getIncomingCommand(raw, getOwnIds())) ? 'duplicate' : handleOne(raw)));
     },
     handleReplayMessages: messages => {
       if (closed || !Array.isArray(messages) || !syncConnection()) return;

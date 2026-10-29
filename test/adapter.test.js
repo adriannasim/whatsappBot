@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeJid, sameUser, messageTimestamp, extractContent, getIncomingCommand, normalizeMessages } from '../src/adapter.js';
+import { createGreeting, getGreetingKind } from '../src/greetings.js';
 
 const group = '123456-789@g.us';
 const ownIds = ['999:4@s.whatsapp.net', '111:2@lid'];
@@ -45,6 +46,7 @@ test('requires actual mention metadata and preserves quoted message identity', (
   assert.equal(parsed.quotedParticipant, '123@s.whatsapp.net');
   assert.equal(parsed.command.id, 'command');
   assert.equal(parsed.command.groupId, group);
+  assert.equal(parsed.kind, 'summarise');
   assert.equal(getIncomingCommand(command({ mentionedJid: ['999:12@s.whatsapp.net'] }), ownIds).mentioned, true);
   assert.equal(getIncomingCommand(command({ mentionedJid: [] }), ownIds).mentioned, false);
   assert.equal(getIncomingCommand(command({ mentionedJid: ['someone@lid'] }), ownIds).mentioned, false);
@@ -133,4 +135,103 @@ test('normalization snapshots messages, filters unrelated/malformed rows, and ma
   assert.equal(rows[1].isCommand, true);
   assert.equal(rows[2].deleted, true);
   assert.throws(() => normalizeMessages(null, group), /array/);
+});
+
+test('recognizes standalone greeting tokens without matching prefixes or conflicting greetings', () => {
+  for (const text of ['!gm', '  !GM\n', 'Hello !gm everyone', '!gm !gm']) {
+    assert.equal(getGreetingKind(text), 'gm');
+  }
+  for (const text of ['!gn', '\t!GN ', 'Time to rest !gn']) assert.equal(getGreetingKind(text), 'gn');
+  for (const text of [null, 1, '', 'gm', '!gmatch', '!gname', 'hello!gm', '!gm!', '!gn.', '!gm !gn', '!GN !GM']) {
+    assert.equal(getGreetingKind(text), null);
+  }
+});
+
+test('greetings need no bot mention or quoted message and target the actual normalized sender', () => {
+  for (const kind of ['gm', 'gn']) {
+    const parsed = getIncomingCommand(message(kind, { message: { conversation: `!${kind}` } }), ownIds);
+    assert.equal(parsed.kind, kind);
+    assert.equal(parsed.senderJid, '123@s.whatsapp.net');
+    assert.equal(parsed.mentioned, false);
+    assert.equal(parsed.quotedId, null);
+  }
+  const lid = getIncomingCommand(message('lid-greeting', {
+    key: { remoteJid: group, id: 'lid-greeting', participant: '456_1:4@lid', participantAlt: '123:8@s.whatsapp.net' },
+    message: { extendedTextMessage: { text: '@999 !gm', contextInfo: {
+      participant: '777@s.whatsapp.net', mentionedJid: ['999@s.whatsapp.net'], stanzaId: 'unrelated',
+    } } },
+  }), ownIds);
+  assert.equal(lid.senderJid, '456@lid');
+  assert.equal(lid.kind, 'gm');
+  const alias = getIncomingCommand(message('alias', {
+    key: { remoteJid: group, id: 'alias', participant: 'not-a-person@lid', participantAlt: '123:8@s.whatsapp.net' },
+    message: { conversation: '!gn' },
+  }), ownIds);
+  assert.equal(alias.senderJid, '123@s.whatsapp.net');
+  const rawParticipant = getIncomingCommand(message('raw-participant', {
+    key: { remoteJid: group, id: 'raw-participant' }, participant: '456:2@lid', message: { conversation: '!gm' },
+  }), ownIds);
+  assert.equal(rawParticipant.senderJid, '456@lid');
+});
+
+test('greetings reject missing senders, bot messages, direct chats and hidden or quoted command content', () => {
+  const greeting = { conversation: '!gm' };
+  for (const key of [
+    { remoteJid: group, id: 'missing' },
+    { remoteJid: group, id: 'invalid', participant: 'alice@lid' },
+    { remoteJid: group, id: 'own', participant: '999:2@s.whatsapp.net' },
+    { remoteJid: group, id: 'own-alias', participant: '123@lid', participantAlt: '999@s.whatsapp.net' },
+    { remoteJid: group, id: 'from-me', participant: '123@s.whatsapp.net', fromMe: true },
+    { remoteJid: '123@s.whatsapp.net', id: 'direct', participant: '123@s.whatsapp.net' },
+  ]) assert.equal(getIncomingCommand(message('greeting', { key, message: greeting }), ownIds), null);
+  const missingWithMention = message('missing', {
+    key: { remoteJid: group, id: 'missing' },
+    message: { extendedTextMessage: { text: '!gn', contextInfo: { participant: '123@s.whatsapp.net', mentionedJid: ['123@s.whatsapp.net'] } } },
+  });
+  assert.equal(getIncomingCommand(missingWithMention, ownIds), null);
+  for (const content of [
+    { protocolMessage: { type: 14, editedMessage: greeting } },
+    { editedMessage: { message: greeting } },
+    { viewOnceMessage: { message: greeting } },
+    { extendedTextMessage: { text: 'Thank you', contextInfo: { quotedMessage: greeting } } },
+  ]) assert.equal(getIncomingCommand(message('hidden', { message: content }), ownIds), null);
+});
+
+test('summary commands retain priority when a message also contains greetings', () => {
+  const mixed = command({}, { message: { extendedTextMessage: {
+    text: '!gm !summarise !gn', contextInfo: { mentionedJid: ['999@s.whatsapp.net'], stanzaId: 'anchor' },
+  } } });
+  const parsed = getIncomingCommand(mixed, ownIds);
+  assert.equal(parsed.kind, 'summarise');
+  assert.equal(parsed.mentioned, true);
+  assert.equal(parsed.quotedId, 'anchor');
+  assert.equal(parsed.senderJid, undefined);
+});
+
+test('greeting replies mention only the supplied verified sender and contain a short encouraging phrase', () => {
+  for (const [kind, salutation] of [['gm', 'Good morning'], ['gn', 'Good night']]) {
+    for (const jid of ['123@s.whatsapp.net', '456@lid']) {
+      const reply = createGreeting(kind, jid);
+      const user = jid.split('@')[0];
+      assert.deepEqual(reply.mentions, [jid]);
+      assert.ok(reply.text.startsWith(`${salutation} @${user}!\n\n`));
+      assert.ok(reply.text.length > salutation.length + user.length + 20);
+      assert.ok(reply.text.length < 300);
+      assert.equal((reply.text.match(/@/g) || []).length, 1);
+    }
+  }
+  for (const jid of [undefined, '123:4@s.whatsapp.net', '123@g.us', 'alice@lid', '123@lid\n']) {
+    assert.throws(() => createGreeting('gm', jid), /normalized participant/);
+  }
+  assert.throws(() => createGreeting('summarise', '123@lid'), /Unknown greeting/);
+});
+
+test('normalization marks morning and night greetings as commands for transcript filtering', () => {
+  const rows = normalizeMessages([
+    message('gm', { message: { conversation: '!gm' } }),
+    message('gn', { message: { conversation: 'Bye !GN' } }),
+    message('ordinary'),
+    message('false-prefix', { message: { conversation: '!gmatch' } }),
+  ], group, { ownIds });
+  assert.deepEqual(rows.map(row => row.isCommand), [true, true, false, false]);
 });

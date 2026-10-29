@@ -1,4 +1,5 @@
 import { isSummariseCommand } from './service.js';
+import { getGreetingKind } from './greetings.js';
 
 const ownObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const emptyContent = (type = 'unknown', deleted = false) => ({ text: '', type, contextInfo: undefined, deleted });
@@ -100,7 +101,11 @@ export function getIncomingCommand(raw, ownIds = []) {
   const own = ownSet(ownIds);
   if (fromBot(raw, own)) return null;
   const content = extractContent(raw);
-  if (content.deleted || !isSummariseCommand(content.text)) return null;
+  if (content.deleted) return null;
+  const kind = isSummariseCommand(content.text) ? 'summarise' : getGreetingKind(content.text);
+  if (!kind) return null;
+  const senderJid = senderIds(raw).find(jid => /^\d+@(s\.whatsapp\.net|lid)$/.test(jid));
+  if (kind !== 'summarise' && !senderJid) return null;
   const context = content.contextInfo;
   const mentioned = Array.isArray(context?.mentionedJid)
     && context.mentionedJid.some(jid => own.has(normalizeJid(jid)));
@@ -108,6 +113,8 @@ export function getIncomingCommand(raw, ownIds = []) {
   const quotedId = sameChat && validId(context?.stanzaId) ? context.stanzaId : null;
   const quotedParticipant = quotedId ? normalizeJid(context?.participant) || undefined : undefined;
   return {
+    kind,
+    ...(kind !== 'summarise' ? { senderJid } : {}),
     command: { id, groupId, text: content.text, timestamp, fromBot: false },
     mentioned, quotedId, quotedParticipant, raw,
   };
@@ -158,7 +165,7 @@ export function normalizeMessages(rawMessages, groupId, { ownIds = [], participa
     if (!person.name) person.name = `Participant ${++anonymous}`;
     rows.push({
       id: raw.key.id, groupId, text: content.text, type: content.type,
-      timestamp, fromBot: bot, isCommand: isSummariseCommand(content.text),
+      timestamp, fromBot: bot, isCommand: isSummariseCommand(content.text) || getGreetingKind(content.text) !== null,
       deleted: content.deleted, person,
     });
   }

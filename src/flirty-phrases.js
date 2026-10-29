@@ -21,4 +21,6 @@ export const FLIRTY_PHRASES = Object.freeze([
   { nickname: 'spark', text: 'No clever pickup line this time. Just a genuine compliment: spending time with you sounds wonderful. ❤️💋' },
   { nickname: 'daydream', text: 'You make me wanna stay in bed with you longer. 😘😉' },
   { nickname: 'summer crush', text: 'Pick a spot by the beach and lets order a sex by the beach. 💦🌊😉' },
+  { nickname: 'wave-maker', text: 'You have made quite a splash with that smile. A beach date with you sounds like the perfect next wave. 💦🌊' },
+  { nickname: 'sweet spark', text: 'Rain in the forecast? Let us find a cosy cafe and see how long we can make one coffee date last. 💦😉' },
 ].map((phrase) => Object.freeze(phrase)));

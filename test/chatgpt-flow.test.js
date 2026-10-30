@@ -92,3 +92,22 @@ test('an interrupted stream never sends its accumulated text to WhatsApp', async
   assert.match(f.diagnostics[0], /"stage":"generation","code":"SUMMARY_STREAM_INTERRUPTED"/);
   assert.doesNotMatch(f.replies[0] + f.diagnostics.join(''), /UNFINISHED|oauth-fixture|friends@g.us/);
 });
+
+test('completed streamed text reaches WhatsApp when the terminal event omits its output', async () => {
+  const item = { id: 'answer-fixture', type: 'message', role: 'assistant', status: 'in_progress', content: [] };
+  const f = await flow([
+    { type: 'response.output_item.added', output_index: 0, item },
+    { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: 'Meet at ' },
+    { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: '6pm.' },
+    { type: 'response.output_text.done', item_id: item.id, output_index: 0, content_index: 0, text: 'Meet at 6pm.' },
+    { type: 'response.output_item.done', output_index: 0, item: {
+      ...item, status: 'completed', content: [{ type: 'output_text', text: 'Meet at 6pm.' }],
+    } },
+    { type: 'response.completed', response: { status: 'completed', output: [] } },
+  ]);
+  assert.equal(await f.request(), 'summarised');
+  assert.equal(f.replies.length, 1);
+  assert.equal(f.replies[0].match(/Meet at 6pm\./g)?.length, 1);
+  assert.deepEqual(f.diagnostics, []);
+  assert.doesNotMatch(f.replies[0], /answer-fixture|oauth-fixture/);
+});

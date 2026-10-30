@@ -281,6 +281,28 @@ test('untrusted error codes and metadata cannot enter summary logs or replies', 
   }
 });
 
+test('empty output diagnostics expose bounded shape counts only', async () => {
+  const logs = [];
+  const f = fixture({
+    summarize: async () => { throw Object.assign(new Error('private output'), {
+      code: 'SUMMARY_EMPTY',
+      outputDiagnostic: {
+        streamTextChars: 0, streamTextEvents: 2, streamDoneItems: 1,
+        terminalOutputItems: 0, terminalAssistantItems: 'secret-name',
+        terminalTextParts: 2 ** 40, text: 'secret-text', itemId: 'secret-id',
+      },
+    }); },
+    onError: text => logs.push(text),
+  });
+  assert.equal(await f.request(), 'failed');
+  assert.deepEqual(JSON.parse(logs[0].slice('Summary diagnostic: '.length)), {
+    stage: 'generation', code: 'SUMMARY_EMPTY', retrieved: 1, selected: 1,
+    elapsedMs: 0, streamTextChars: 0, streamTextEvents: 2, streamDoneItems: 1,
+    terminalOutputItems: 0,
+  });
+  assert.doesNotMatch(logs.join('') + f.replies[0].text, /private|secret/);
+});
+
 test('preparation, history and delivery failures are distinguishable from generation failures', async () => {
   for (const [stage, options] of [
     ['history', { loadMessages: async () => { throw new Error('secret history detail'); } }],

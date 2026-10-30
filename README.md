@@ -392,6 +392,11 @@ WhatsApp connectivity, account eligibility, history availability, or real infere
   `SUMMARY_INCOMPLETE` means the provider reported unfinished output. The group
   receives guidance for recognized failures. Use the diagnostic before changing
   the model, signing in again or increasing limits.
+  `SUMMARY_EMPTY` also includes counts of terminal output items/text parts and
+  streamed text events/characters, without their content. In ChatGPT mode the bot
+  prefers text in the completed response. If that response omits its output, it
+  can use the collected assistant text only after successful `response.completed`;
+  failed, incomplete, refused or interrupted responses never publish that text.
 - **ChatGPT sign-in required:** stop the bot and run `npm run login`; use
   `npm run login -- --enable-plan` if plan usage was not granted.
 - **Model unavailable:** choose an exact ID from `npm run models`, then restart.

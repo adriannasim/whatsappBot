@@ -99,25 +99,154 @@ function timeoutError() {
   return new SummaryError('The summary request timed out. Please try again with a shorter range.', 'SUMMARY_TIMEOUT');
 }
 
+function refusalError() {
+  return new SummaryError('The summary service could not summarise this range. Please choose a different range.', 'SUMMARY_REFUSED');
+}
+
+function outputDiagnostic(result) {
+  const items = Array.isArray(result?.output) ? result.output : [];
+  const assistants = items.filter(item => item?.type === 'message' && item.role === 'assistant');
+  return {
+    streamTextChars: 0, streamTextEvents: 0, streamDoneItems: 0,
+    terminalOutputItems: items.length, terminalAssistantItems: assistants.length,
+    terminalTextParts: assistants.reduce((count, item) => count + (Array.isArray(item.content)
+      ? item.content.filter(part => part?.type === 'output_text').length : 0), 0),
+  };
+}
+
 function completedText(result) {
   if (result?.error || result?.status === 'failed') throw providerError(result?.error?.code)
     || new SummaryError('The summary failed before it completed. Please try again.');
   if (result?.status === 'incomplete' || result?.incomplete_details) throw incompleteError(result?.incomplete_details?.reason);
   if (!result || result.status !== 'completed') throw unreadableError();
-  // Use the terminal response's assistant text only: never reasoning or deltas.
+  // An explicit terminal output is authoritative; never use reasoning text.
   const content = (Array.isArray(result.output) ? result.output : [])
     .filter((item) => item?.type === 'message' && item.role === 'assistant')
     .flatMap((item) => Array.isArray(item.content) ? item.content : []);
   if (content.some(part => part?.type === 'refusal')) {
-    throw new SummaryError('The summary service could not summarise this range. Please choose a different range.', 'SUMMARY_REFUSED');
+    throw refusalError();
   }
   const text = content
     .filter((part) => part?.type === 'output_text' && typeof part.text === 'string')
     .map((part) => part.text)
     .join('\n')
     .trim();
-  if (!text) throw new SummaryError('The summary service returned no summary. Please try again with a different range.', 'SUMMARY_EMPTY');
+  if (!text) {
+    const error = new SummaryError('The summary service returned no summary. Please try again with a different range.', 'SUMMARY_EMPTY');
+    error.outputDiagnostic = outputDiagnostic(result);
+    throw error;
+  }
   return text;
+}
+
+/** Stream text stays local until a successful terminal response confirms completion. */
+function createStreamTextCollector() {
+  const items = new Map();
+  const indexes = new Map();
+  const indexValid = value => Number.isSafeInteger(value) && value >= 0 && value <= MAX_STREAM_BYTES;
+  const idValid = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\s\x00-\x1f\x7f]/.test(value);
+  let textEvents = 0;
+  let doneItems = 0;
+  let refused = false;
+  let invalidFallback = false;
+  function itemFor(index, id) {
+    if (!indexValid(index)) { invalidFallback = true; return null; }
+    if (!idValid(id)) {
+      invalidFallback = true;
+      const previous = items.get(index);
+      if (previous) previous.blocked = true;
+      else items.set(index, { id: null, parts: new Map(), blocked: true, finished: false });
+      return null;
+    }
+    let item = items.get(index);
+    if (!item) { item = { id, parts: new Map(), blocked: false, finished: false }; items.set(index, item); }
+    const previousIndex = indexes.get(id);
+    if (item.id !== id || (previousIndex !== undefined && previousIndex !== index)) {
+      invalidFallback = true;
+      item.blocked = true;
+      if (previousIndex !== undefined) items.get(previousIndex).blocked = true;
+      return null;
+    }
+    indexes.set(id, index);
+    return item;
+  }
+  function snapshotPart(part) {
+    if (part?.type === 'refusal') refused = true;
+    if (part?.type === 'output_text' && typeof part.text !== 'string') invalidFallback = true;
+    return part?.type === 'output_text' && typeof part.text === 'string' ? { text: part.text, done: true } : null;
+  }
+  function accept(event) {
+    if (event?.type === 'response.refusal.delta' || event?.type === 'response.refusal.done') refused = true;
+    if (event?.type === 'response.output_item.added' || event?.type === 'response.output_item.done') {
+      const metadata = event.item;
+      if (Array.isArray(metadata?.content) && metadata.content.some(part => part?.type === 'refusal')) refused = true;
+      const item = itemFor(event.output_index, metadata?.id);
+      if (!item) return;
+      if (metadata?.type !== 'message' || metadata.role !== 'assistant') item.blocked = true;
+      if (event.type === 'response.output_item.done') {
+        doneItems++;
+        item.finished = true;
+        if (metadata.status !== undefined && metadata.status !== 'completed') item.blocked = true;
+        item.parts.clear();
+        if (Array.isArray(metadata.content)) metadata.content.forEach((part, index) => {
+          const snapshot = snapshotPart(part);
+          if (snapshot) item.parts.set(index, snapshot);
+        });
+      }
+      return;
+    }
+    const textEvent = event?.type === 'response.output_text.delta' || event?.type === 'response.output_text.done';
+    const partEvent = event?.type === 'response.content_part.done';
+    const partAdded = event?.type === 'response.content_part.added';
+    if ((partEvent || partAdded) && event.part?.type === 'refusal') refused = true;
+    if (!textEvent && !partEvent && !partAdded) return;
+    if (!indexValid(event.content_index)) { invalidFallback = true; return; }
+    const item = itemFor(event.output_index, event.item_id);
+    if (!item || item.blocked || item.finished) return;
+    if (partAdded) return;
+    // Typed output_text events identify assistant output even when the provider
+    // omits item.added. Later contradictory item metadata invalidates this text.
+    if (partEvent) {
+      const snapshot = snapshotPart(event.part);
+      const previous = item.parts.get(event.content_index);
+      if (!previous?.blocked) item.parts.set(event.content_index, snapshot ?? { text: '', done: true, blocked: true });
+      if (snapshot) textEvents++;
+      return;
+    }
+    const text = event.type === 'response.output_text.delta' ? event.delta : event.text;
+    if (typeof text !== 'string') {
+      invalidFallback = true;
+      if (event.type === 'response.output_text.done') item.parts.set(event.content_index, { text: '', done: true });
+      return;
+    }
+    textEvents++;
+    const previous = item.parts.get(event.content_index);
+    if (previous?.blocked) return;
+    if (event.type === 'response.output_text.done') item.parts.set(event.content_index, { text, done: true });
+    else if (!previous?.done) item.parts.set(event.content_index, { text: (previous?.text ?? '') + text, done: false });
+  }
+  function text() {
+    return [...items].sort(([left], [right]) => left - right)
+      .filter(([, item]) => !item.blocked)
+      .flatMap(([, item]) => [...item.parts].sort(([left], [right]) => left - right).map(([, part]) => part.text))
+      .join('\n').trim();
+  }
+  return {
+    accept,
+    complete(result) {
+      if (refused) throw refusalError();
+      try { return completedText(result); }
+      catch (error) {
+        if (error.code !== 'SUMMARY_EMPTY') throw error;
+        const streamed = text();
+        error.outputDiagnostic = { ...error.outputDiagnostic, streamTextChars: streamed.length,
+          streamTextEvents: textEvents, streamDoneItems: doneItems };
+        const omittedOutput = result.output == null || (Array.isArray(result.output) && result.output.length === 0);
+        if (omittedOutput && !invalidFallback && streamed) return streamed;
+        throw error;
+      }
+    },
+  };
 }
 
 async function readWithAbort(reader, signal) {
@@ -144,6 +273,7 @@ async function readCompletedStream(response, signal) {
   let buffer = '';
   let data = [];
   let totalBytes = 0;
+  const collected = createStreamTextCollector();
   function decode(value, options) {
     try { return decoder.decode(value, options); } catch { throw unreadableError(); }
   }
@@ -163,7 +293,8 @@ async function readCompletedStream(response, signal) {
     if (event?.type === 'response.incomplete') {
       throw incompleteError(event.response?.incomplete_details?.reason);
     }
-    if (event?.type === 'response.completed') return completedText(event.response);
+    if (event?.type === 'response.completed') return collected.complete(event.response);
+    collected.accept(event);
     return null;
   }
 

@@ -220,6 +220,16 @@ export function createSummaryService({
         if (['max_output_tokens', 'content_filter', 'unknown'].includes(error?.reason)) {
           diagnostic.reason = error.reason;
         }
+        if (diagnostic.code === 'SUMMARY_EMPTY') {
+          // Shape/counts only: never serialize arbitrary error metadata.
+          for (const key of ['streamTextChars', 'streamTextEvents', 'streamDoneItems',
+            'terminalOutputItems', 'terminalAssistantItems', 'terminalTextParts']) {
+            const count = error?.outputDiagnostic?.[key];
+            if (Number.isSafeInteger(count) && count >= 0 && count <= 1024 * 1024) {
+              diagnostic[key] = count;
+            }
+          }
+        }
         try { onError(`Summary diagnostic: ${JSON.stringify(diagnostic)}`); }
         catch { /* Diagnostics must not prevent the recovery reply. */ }
       }

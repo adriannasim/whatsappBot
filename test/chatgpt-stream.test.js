@@ -15,6 +15,12 @@ const build = (fetchImpl, extra = {}) => createSummarizer({
   authMode: 'chatgpt', apiKey: 'unused-api-key', model: 'chosen-model',
   getAccessToken: async () => 'oauth-test-token', fetchImpl, ...extra,
 });
+const minimalCompleted = output => ({ type: 'response.completed', response: { status: 'completed', ...(output === undefined ? {} : { output }) } });
+const delta = (text, extra = {}) => ({ type: 'response.output_text.delta', item_id: 'msg-1', output_index: 0, content_index: 0, delta: text, ...extra });
+const doneText = (text, extra = {}) => ({ ...delta('', extra), type: 'response.output_text.done', text });
+const itemEvent = (type, item = {}, output_index = 0) => ({ type: `response.output_item.${type}`, output_index,
+  item: { id: 'msg-1', type: 'message', role: 'assistant', ...item } });
+const runEvents = events => build(async () => fragmented(events.map(event => frame(event)).join(''), 13))(messages);
 
 function fragmented(text, chunkSize = 1) {
   const bytes = new TextEncoder().encode(text);
@@ -60,6 +66,91 @@ test('multiline SSE data and event fields are handled without using text deltas'
   const event = completed('Complete.');
   const text = `event: response.completed\ndata: {"type":"response.completed",\ndata: "response":${JSON.stringify(event.response)}}\n\n`;
   assert.equal(await build(async () => fragmented(text, 7))(messages), 'Complete.');
+});
+
+test('minimal completed responses use indexed assistant stream text only after completion', async () => {
+  for (const output of [undefined, null, []]) {
+    assert.equal(await runEvents([delta('Dinner '), delta('at six.'), minimalCompleted(output)]), 'Dinner at six.');
+    assert.equal(await runEvents([itemEvent('added', { content: [], status: 'in_progress' }), delta('Dinner '), doneText('Dinner at six.'), minimalCompleted(output)]), 'Dinner at six.');
+  }
+});
+
+test('done snapshots replace deltas, item snapshots replace parts, and indices determine output order', async () => {
+  const second = { item_id: 'msg-2', output_index: 1 };
+  assert.equal(await runEvents([
+    delta('Stale second', second), doneText('Second.', second),
+    delta('Stale first'), doneText('First draft.'),
+    { type: 'response.content_part.done', item_id: 'msg-1', output_index: 0, content_index: 0, part: { type: 'output_text', text: 'First snapshot.' } },
+    itemEvent('done', { status: 'completed', content: [{ type: 'output_text', text: 'First.' }] }),
+    delta('Ignored after done'), minimalCompleted([]),
+  ]), 'First.\nSecond.');
+  assert.equal(await runEvents([doneText('Later.', { content_index: 1 }), doneText('Earlier.'), minimalCompleted()]), 'Earlier.\nLater.');
+});
+
+test('terminal content remains authoritative and does not duplicate or revive streamed text', async () => {
+  assert.equal(await runEvents([delta('Discarded earlier text'), doneText('Discarded done text'), completed('Final summary.')]), 'Final summary.');
+  for (const terminal of [
+    completed(' '),
+    minimalCompleted([{ type: 'message', role: 'user', content: [{ type: 'output_text', text: 'Untrusted user text' }] }]),
+    minimalCompleted([{ type: 'reasoning', summary: [{ text: 'Private reasoning' }] }]),
+    minimalCompleted({ text: 'Malformed terminal output' }),
+  ]) await assert.rejects(runEvents([doneText('Do not revive'), terminal]), { code: 'SUMMARY_EMPTY' });
+});
+
+test('invalid identities, contradictory metadata, and non-assistant content cannot supply fallback text', async () => {
+  for (const events of [
+    [delta('secret', { item_id: undefined })],
+    [delta('secret', { output_index: -1 })],
+    [delta('secret', { content_index: '0' })],
+    [delta('secret'), doneText('secret', { item_id: 'different-id' })],
+    [delta('secret'), delta('secret', { output_index: 1 })],
+    [delta('secret'), itemEvent('added', { role: 'user' })],
+    [delta('secret'), itemEvent('added', { id: undefined, role: 'user' })],
+    [itemEvent('added', { type: 'reasoning' }), delta('secret')],
+    [itemEvent('added', { type: 'function_call' }), delta('secret')],
+    [delta('secret'), itemEvent('done', { status: 'completed', content: [] })],
+    [delta('secret'), { type: 'response.content_part.done', item_id: 'msg-1', output_index: 0, content_index: 0, part: { type: 'reasoning_text', text: 'secret' } }],
+    [delta('secret'), { type: 'response.content_part.done', item_id: 'msg-1', output_index: 0, content_index: 0, part: { type: 'reasoning_text', text: 'secret' } }, doneText('Do not revive')],
+    [{ type: 'response.reasoning_text.delta', delta: 'secret', item_id: 'msg-1', output_index: 0, content_index: 0 }],
+  ]) await assert.rejects(runEvents([...events, minimalCompleted()]), { code: 'SUMMARY_EMPTY' });
+});
+
+test('refusal, failure and incomplete outcomes discard even completed text snapshots', async () => {
+  for (const [ending, code] of [
+    [{ type: 'response.refusal.delta', delta: 'secret-refusal' }, 'SUMMARY_REFUSED'],
+    [itemEvent('done', { content: [{ type: 'refusal', refusal: 'secret-refusal' }] }), 'SUMMARY_REFUSED'],
+    [{ type: 'response.failed', response: { error: { code: 'server_error', message: 'secret' } } }, 'SUMMARY_SERVICE_UNAVAILABLE'],
+    [{ type: 'response.incomplete', response: { incomplete_details: { reason: 'max_output_tokens' } } }, 'SUMMARY_INCOMPLETE'],
+    [{ type: 'error', code: 'unknown', message: 'secret' }, 'SUMMARY_FAILED'],
+  ]) await assert.rejects(runEvents([doneText('secret-partial'), ending, minimalCompleted()]), { code });
+  await assert.rejects(runEvents([doneText('secret-partial')]), { code: 'SUMMARY_STREAM_INTERRUPTED' });
+});
+
+test('malformed final stream metadata blocks fallback but never overrides valid terminal text', async () => {
+  for (const malformed of [
+    doneText('Final', { content_index: '0' }),
+    doneText('Final', { output_index: null }),
+    doneText('Final', { item_id: undefined }),
+    doneText('Final', { item_id: 'different-id' }),
+    doneText(123),
+    { type: 'response.content_part.done', output_index: 0, content_index: '0', item_id: 'msg-1', part: { type: 'output_text', text: 'Final' } },
+    { type: 'response.content_part.done', output_index: 0, content_index: 0, item_id: 'msg-1', part: { type: 'output_text', text: {} } },
+    itemEvent('done', { content: [{ type: 'output_text', text: 123 }] }),
+    itemEvent('done', { content: [{ type: 'output_text', text: 'Final' }] }, '0'),
+  ]) {
+    await assert.rejects(runEvents([delta('Draft'), malformed, minimalCompleted()]), { code: 'SUMMARY_EMPTY' });
+    assert.equal(await runEvents([delta('Draft'), malformed, completed('Authoritative final.')]), 'Authoritative final.');
+  }
+});
+
+test('empty-output diagnostics contain only locally constructed numeric counts', async () => {
+  await assert.rejects(runEvents([doneText('secret-text'), completed(' ')]), error => {
+    assert.equal(error.code, 'SUMMARY_EMPTY');
+    assert.deepEqual(error.outputDiagnostic, { streamTextChars: 11, streamTextEvents: 1, streamDoneItems: 0,
+      terminalOutputItems: 2, terminalAssistantItems: 1, terminalTextParts: 1 });
+    assert.doesNotMatch(`${error.message} ${JSON.stringify(error)}`, /secret-text|msg-1|oauth-test-token|Dinner at six/);
+    return true;
+  });
 });
 
 test('failure and incomplete events after deltas reject without returning partial output', async () => {
@@ -139,7 +230,10 @@ test('limits stream bytes and cancels the transport', async () => {
 
 test('stalled body reads time out and cancel without posting partial data', async () => {
   let cancelled = false;
-  const response = new Response(new ReadableStream({ cancel() { cancelled = true; } }));
+  const response = new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode(frame(doneText('secret-completed-fragment')))); },
+    cancel() { cancelled = true; },
+  }));
   const keepAlive = setInterval(() => {}, 1000);
   try {
     await assert.rejects(build(async () => response, { timeoutMs: 10 })(messages), { code: 'SUMMARY_TIMEOUT' });

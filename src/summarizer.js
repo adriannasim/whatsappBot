@@ -2,9 +2,11 @@ const ENDPOINT = 'https://api.openai.com/v1/responses';
 const MAX_STREAM_BYTES = 1024 * 1024;
 
 class SummaryError extends Error {
-  constructor(message, code = 'SUMMARY_FAILED') {
+  constructor(message, code = 'SUMMARY_FAILED', { status, reason } = {}) {
     super(message);
     this.code = code;
+    if (Number.isInteger(status) && status >= 400 && status <= 599) this.status = status;
+    if (reason !== undefined) this.reason = ['max_output_tokens', 'content_filter'].includes(reason) ? reason : 'unknown';
   }
 }
 
@@ -48,7 +50,22 @@ function planError(code) {
   return null;
 }
 
+function providerError(code) {
+  const plan = planError(code);
+  if (plan) return plan;
+  if (code === 'model_not_found') return new SummaryError('The configured summary model is unavailable. Ask the bot owner to check the model and access.', 'MODEL_NOT_FOUND');
+  if (code === 'rate_limit_exceeded') return new SummaryError('The summary service is rate limited. Please try again later.', 'SUMMARY_RATE_LIMIT');
+  if (code === 'server_error') return new SummaryError('Summary service is temporarily unavailable. Please try again later.', 'SUMMARY_SERVICE_UNAVAILABLE');
+  return null;
+}
+
 function httpError(status, authMode, code) {
+  const error = classifyHttpError(status, authMode, code);
+  if (Number.isInteger(status) && status >= 400 && status <= 599) error.status = status;
+  return error;
+}
+
+function classifyHttpError(status, authMode, code) {
   if (authMode === 'chatgpt') {
     const structured = planError(code);
     if (structured) return structured;
@@ -56,17 +73,26 @@ function httpError(status, authMode, code) {
     if (status === 403) return new SummaryError('ChatGPT denied this request. Check the account, workspace and granted permissions.', 'AUTH_DENIED');
   }
   if (status === 401 || status === 403) {
-    return new SummaryError('Summary service authentication failed. Ask the bot owner to check its API key and access.');
+    return new SummaryError('Summary service authentication failed. Ask the bot owner to check its API key and access.', status === 401 ? 'API_AUTH_FAILED' : 'API_ACCESS_DENIED');
   }
+  if (code === 'model_not_found') return providerError(code);
   if (status === 429) {
     return new SummaryError(authMode === 'chatgpt'
       ? 'The summary service is rate limited. Please try again later.'
-      : 'Summary service is busy or out of credit. Please try again later.');
+      : 'Summary service is busy or out of credit. Please try again later.', 'SUMMARY_RATE_LIMIT');
   }
   if (status >= 500) {
-    return new SummaryError('Summary service is temporarily unavailable. Please try again later.');
+    return new SummaryError('Summary service is temporarily unavailable. Please try again later.', 'SUMMARY_SERVICE_UNAVAILABLE');
   }
-  return new SummaryError('Summary service rejected the request. Ask the bot owner to check its configuration.');
+  return new SummaryError('Summary service rejected the request. Ask the bot owner to check its configuration.', 'SUMMARY_CONFIG');
+}
+
+function incompleteError(reason) {
+  return new SummaryError('The summary did not finish. Please try again with a shorter range.', 'SUMMARY_INCOMPLETE', { reason: reason ?? 'unknown' });
+}
+
+function unreadableError() {
+  return new SummaryError('The summary service returned an unreadable response. Please try again.', 'SUMMARY_UNREADABLE');
 }
 
 function timeoutError() {
@@ -74,18 +100,23 @@ function timeoutError() {
 }
 
 function completedText(result) {
-  if (!result || result.status !== 'completed' || result.error || result.incomplete_details) {
-    throw new SummaryError('The summary did not finish. Please try again with a shorter range.');
-  }
+  if (result?.error || result?.status === 'failed') throw providerError(result?.error?.code)
+    || new SummaryError('The summary failed before it completed. Please try again.');
+  if (result?.status === 'incomplete' || result?.incomplete_details) throw incompleteError(result?.incomplete_details?.reason);
+  if (!result || result.status !== 'completed') throw unreadableError();
   // Use the terminal response's assistant text only: never reasoning or deltas.
-  const text = (Array.isArray(result.output) ? result.output : [])
+  const content = (Array.isArray(result.output) ? result.output : [])
     .filter((item) => item?.type === 'message' && item.role === 'assistant')
-    .flatMap((item) => Array.isArray(item.content) ? item.content : [])
+    .flatMap((item) => Array.isArray(item.content) ? item.content : []);
+  if (content.some(part => part?.type === 'refusal')) {
+    throw new SummaryError('The summary service could not summarise this range. Please choose a different range.', 'SUMMARY_REFUSED');
+  }
+  const text = content
     .filter((part) => part?.type === 'output_text' && typeof part.text === 'string')
     .map((part) => part.text)
     .join('\n')
     .trim();
-  if (!text) throw new SummaryError('The summary service returned no summary. Please try again with a different range.');
+  if (!text) throw new SummaryError('The summary service returned no summary. Please try again with a different range.', 'SUMMARY_EMPTY');
   return text;
 }
 
@@ -105,13 +136,17 @@ async function readWithAbort(reader, signal) {
 
 async function readCompletedStream(response, signal) {
   if (typeof response.body?.getReader !== 'function') {
-    throw new SummaryError('The summary service returned an unreadable stream. Please try again.');
+    throw unreadableError();
   }
-  const reader = response.body.getReader();
+  let reader;
+  try { reader = response.body.getReader(); } catch { throw unreadableError(); }
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let buffer = '';
   let data = [];
   let totalBytes = 0;
+  function decode(value, options) {
+    try { return decoder.decode(value, options); } catch { throw unreadableError(); }
+  }
 
   function eventResult() {
     if (data.length === 0) return null;
@@ -120,13 +155,13 @@ async function readCompletedStream(response, signal) {
     if (json === '[DONE]') return null;
     let event;
     try { event = JSON.parse(json); }
-    catch { throw new SummaryError('The summary service returned an unreadable stream. Please try again.'); }
+    catch { throw unreadableError(); }
     if (event?.type === 'response.failed' || event?.type === 'error') {
       const code = event.response?.error?.code || event.error?.code || event.code;
-      throw planError(code) || new SummaryError('The summary failed before it completed. Please try again.');
+      throw providerError(code) || new SummaryError('The summary failed before it completed. Please try again.');
     }
     if (event?.type === 'response.incomplete') {
-      throw new SummaryError('The summary did not finish. Please try again with a shorter range.');
+      throw incompleteError(event.response?.incomplete_details?.reason);
     }
     if (event?.type === 'response.completed') return completedText(event.response);
     return null;
@@ -152,7 +187,7 @@ async function readCompletedStream(response, signal) {
     while (true) {
       const { done, value } = await readWithAbort(reader, signal);
       if (done) {
-        buffer += decoder.decode();
+        buffer += decode();
         const result = consumeLines(true);
         if (result !== null) return result;
         break;
@@ -161,17 +196,17 @@ async function readCompletedStream(response, signal) {
       if (totalBytes > MAX_STREAM_BYTES) {
         throw new SummaryError('The summary response was too large. Please try a shorter conversation.', 'OUTPUT_TOO_LARGE');
       }
-      buffer += decoder.decode(value, { stream: true });
+      buffer += decode(value, { stream: true });
       const result = consumeLines();
       if (result !== null) return result;
     }
     // EOF without a framed response.completed is an interruption, even if some
     // output text was already streamed or an unterminated JSON line is present.
-    throw new SummaryError('The summary stream ended before completion. Please try again.');
+    throw new SummaryError('The summary stream ended before completion. Please try again.', 'SUMMARY_STREAM_INTERRUPTED');
   } catch (error) {
     if (signal.aborted) throw timeoutError();
     if (error instanceof SummaryError) throw error;
-    throw new SummaryError('The summary stream was interrupted. Please try again.');
+    throw new SummaryError('The summary stream was interrupted. Please try again.', 'SUMMARY_STREAM_INTERRUPTED');
   } finally {
     // Cancellation also releases a slow provider connection after a terminal
     // event, malformed stream, size limit or timeout. Do not wait on transport.
@@ -280,15 +315,13 @@ export function createSummarizer({
       if (signal.aborted) {
         throw timeoutError();
       }
-      throw new Error('Could not reach the summary service. Please try again later.');
+      throw new SummaryError('Could not reach the summary service. Please try again later.', 'SUMMARY_NETWORK');
     }
 
-    // Inspect only machine-readable plan error codes; never expose response text.
+    // Inspect only machine-readable error codes; never expose response text.
     if (!response.ok) {
       let code;
-      if (authMode === 'chatgpt') {
-        try { code = (await response.json())?.error?.code; } catch { /* A detail-only error is also possible. */ }
-      }
+      try { code = (await response.json())?.error?.code; } catch { /* A detail-only error is also possible. */ }
       if (signal.aborted) throw timeoutError();
       throw httpError(response.status, authMode, code);
     }
@@ -302,7 +335,7 @@ export function createSummarizer({
       if (signal.aborted) {
         throw timeoutError();
       }
-      throw new Error('The summary service returned an unreadable response. Please try again.');
+      throw unreadableError();
     }
 
     return completedText(result);

@@ -378,6 +378,20 @@ WhatsApp connectivity, account eligibility, history availability, or real infere
   identifiers against Baileys' verified phone-number/LID mappings.
 - **QR needed after upgrading:** the old whatsapp-web.js session is incompatible;
   link Baileys as a new device with `npm run groups`.
+- **Summary fails after `recent_buffer`:** this history diagnostic means the
+  requested range was found locally. `retained` counts buffered rows before
+  commands, bot replies and non-text messages are excluded. It does not confirm
+  that AI generation or WhatsApp delivery succeeded. Retry with a new command,
+  then run `sudo journalctl -u whatsapp-summary-bot.service --since '10 minutes ago' --no-pager -o cat | grep -F 'Summary diagnostic:'`.
+  These failure logs show the stage (`history`, `preparation`, `generation`,
+  `formatting` or `delivery`), a fixed error code, retrieved and selected message
+  counts, elapsed milliseconds, and HTTP status or a fixed incomplete reason when
+  available. They exclude conversation content, identifiers, credentials and raw
+  provider errors. `SUMMARY_TIMEOUT` means the AI request timed out;
+  `SUMMARY_STREAM_INTERRUPTED` means it ended without a completed response;
+  `SUMMARY_INCOMPLETE` means the provider reported unfinished output. The group
+  receives guidance for recognized failures. Use the diagnostic before changing
+  the model, signing in again or increasing limits.
 - **ChatGPT sign-in required:** stop the bot and run `npm run login`; use
   `npm run login -- --enable-plan` if plan usage was not granted.
 - **Model unavailable:** choose an exact ID from `npm run models`, then restart.

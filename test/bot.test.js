@@ -299,8 +299,9 @@ for (const action of ['reconnect', 'close']) {
     assert.deepEqual(await processing, ['failed']);
     assert.equal(f.calls.inputs.length, 0);
     assert.equal(f.calls.sends.length, 0);
-    assert.equal(f.calls.errors.length, 1);
-    assert.match(f.calls.errors[0], /Check the connection/);
+    assert.equal(f.calls.errors.length, 2);
+    assert.match(f.calls.errors[0], /Summary diagnostic: .*"stage":"history"/);
+    assert.match(f.calls.errors[1], /Check the connection/);
     if (action === 'close') {
       assert.deepEqual(await f.bot.handleMessages([command('later')]), ['ignored']);
       assert.equal(await f.bot.getMessage({ remoteJid: GROUP, id: 'out-1' }), undefined);
@@ -319,7 +320,9 @@ for (const action of ['reconnect', 'close']) {
     assert.deepEqual(await processing, ['failed']);
     assert.equal(f.calls.inputs.length, 1);
     assert.equal(f.calls.sends.length, 0);
-    assert.equal(f.calls.errors.length, 1);
+    assert.equal(f.calls.errors.length, 2);
+    assert.match(f.calls.errors[0], /Summary diagnostic: .*"stage":"delivery"/);
+    assert.match(f.calls.errors[1], /Check the connection/);
   });
 }
 

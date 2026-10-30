@@ -8,6 +8,7 @@ import { createSummaryService } from '../src/service.js';
 async function flow(events) {
   const requests = [];
   const replies = [];
+  const diagnostics = [];
   let reads = 0;
   let tokenReads = 0;
   const fetchImpl = async (url, init) => {
@@ -42,6 +43,7 @@ async function flow(events) {
     loadMessages: async () => { reads++; return [anchor]; },
     summarize: ai.summarize,
     reply: async (_group, _command, text) => { replies.push(text); },
+    onError: text => diagnostics.push(text),
   });
   let commandCount = 0;
   const request = () => handle({
@@ -49,7 +51,7 @@ async function flow(events) {
     mentioned: true,
     quotedId: 'anchor',
   });
-  return { request, replies, requests, reads: () => reads, tokenReads: () => tokenReads };
+  return { request, replies, requests, diagnostics, reads: () => reads, tokenReads: () => tokenReads };
 }
 
 test('account discovery and configured model produce only a completed summary in the group', async () => {
@@ -85,6 +87,8 @@ test('an interrupted stream never sends its accumulated text to WhatsApp', async
   const f = await flow([{ type: 'response.output_text.delta', delta: 'UNFINISHED PREVIEW' }]);
   assert.equal(await f.request(), 'failed');
   assert.equal(f.replies.length, 1);
-  assert.match(f.replies[0], /could not complete/);
-  assert.doesNotMatch(f.replies[0], /UNFINISHED/);
+  assert.match(f.replies[0], /connection.*ended/i);
+  assert.equal(f.diagnostics.length, 1);
+  assert.match(f.diagnostics[0], /"stage":"generation","code":"SUMMARY_STREAM_INTERRUPTED"/);
+  assert.doesNotMatch(f.replies[0] + f.diagnostics.join(''), /UNFINISHED|oauth-fixture|friends@g.us/);
 });

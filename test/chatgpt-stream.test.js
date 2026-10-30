@@ -67,7 +67,7 @@ test('failure and incomplete events after deltas reject without returning partia
     [{ type: 'response.failed', response: { error: { code: 'subscription_sharing_usage_limit_exceeded', message: 'private error' } } }, 'PLAN_LIMIT'],
     [{ type: 'response.failed', response: { error: { code: 'subscription_sharing_usage_unavailable' } } }, 'PLAN_UNAVAILABLE'],
     [{ type: 'error', code: 'subscription_sharing_usage_limit_exceeded' }, 'PLAN_LIMIT'],
-    [{ type: 'response.incomplete' }, 'SUMMARY_FAILED'],
+    [{ type: 'response.incomplete' }, 'SUMMARY_INCOMPLETE'],
     [{ type: 'response.failed', response: { error: { code: 'unknown', message: 'private error' } } }, 'SUMMARY_FAILED'],
   ]) {
     const body = frame({ type: 'response.output_text.delta', delta: 'PRIVATE PARTIAL' }) + frame(event);
@@ -80,15 +80,39 @@ test('failure and incomplete events after deltas reject without returning partia
 });
 
 test('EOF, DONE, malformed JSON, unfinished frames and invalid UTF-8 never count as completion', async () => {
-  for (const body of [
-    frame({ type: 'response.output_text.delta', delta: 'Partial' }),
-    'data: [DONE]\n\n',
-    'data: {broken\n\n',
-    frame(completed()).trimEnd(),
+  for (const [body, code] of [
+    [frame({ type: 'response.output_text.delta', delta: 'Partial' }), 'SUMMARY_STREAM_INTERRUPTED'],
+    ['data: [DONE]\n\n', 'SUMMARY_STREAM_INTERRUPTED'],
+    ['data: {broken\n\n', 'SUMMARY_UNREADABLE'],
+    [frame(completed()).trimEnd(), 'SUMMARY_STREAM_INTERRUPTED'],
   ]) {
-    await assert.rejects(build(async () => fragmented(body))(messages));
+    await assert.rejects(build(async () => fragmented(body))(messages), { code });
   }
-  await assert.rejects(build(async () => new Response(new Uint8Array([0xc3, 0x28])))(messages));
+  await assert.rejects(build(async () => new Response(new Uint8Array([0xc3, 0x28])))(messages), { code: 'SUMMARY_UNREADABLE' });
+});
+
+test('stream failures and incomplete reasons are classified without provider data or partial text', async () => {
+  for (const [event, code, reason] of [
+    [{ type: 'response.failed', response: { error: { code: 'model_not_found', message: 'secret-provider-text' } } }, 'MODEL_NOT_FOUND'],
+    [{ type: 'response.failed', response: { error: { code: '__proto__', message: 'secret-provider-text' } } }, 'SUMMARY_FAILED'],
+    [{ type: 'response.failed', response: { error: { code: 'rate_limit_exceeded' } } }, 'SUMMARY_RATE_LIMIT'],
+    [{ type: 'response.failed', response: { error: { code: 'server_error' } } }, 'SUMMARY_SERVICE_UNAVAILABLE'],
+    [{ type: 'response.incomplete', response: { incomplete_details: { reason: 'max_output_tokens' } } }, 'SUMMARY_INCOMPLETE', 'max_output_tokens'],
+    [{ type: 'response.incomplete', response: { incomplete_details: { reason: 'content_filter' } } }, 'SUMMARY_INCOMPLETE', 'content_filter'],
+    [{ type: 'response.incomplete', response: { incomplete_details: { reason: 'secret-reason' } } }, 'SUMMARY_INCOMPLETE', 'unknown'],
+    [{ type: 'response.completed', response: { status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'refusal', refusal: 'secret-refusal' }] }] } }, 'SUMMARY_REFUSED'],
+  ]) {
+    const body = frame({ type: 'response.output_text.delta', delta: 'secret-partial' }) + frame(event);
+    await assert.rejects(build(async () => fragmented(body, 128))(messages), error => {
+      assert.equal(error.code, code);
+      assert.equal(error.reason, reason);
+      assert.doesNotMatch(`${error.message} ${JSON.stringify(error)}`, /secret-|oauth-test-token|Dinner at six/);
+      return true;
+    });
+  }
+  await assert.rejects(build(async () => ({ ok: true, body: null }))(messages), { code: 'SUMMARY_UNREADABLE' });
+  const response = new Response(new ReadableStream({ start(controller) { controller.error(new Error('secret-transport')); } }));
+  await assert.rejects(build(async () => response)(messages), { code: 'SUMMARY_STREAM_INTERRUPTED' });
 });
 
 test('empty, incomplete and non-assistant terminal output is rejected', async () => {
@@ -149,9 +173,14 @@ test('HTTP plan errors and authentication errors retain safe guidance', async ()
     [503, 'subscription_sharing_usage_unavailable', 'PLAN_UNAVAILABLE'],
     [401, 'invalid_token', 'AUTH_REQUIRED'],
     [403, 'denied', 'AUTH_DENIED'],
+    [404, 'model_not_found', 'MODEL_NOT_FOUND'],
+    [400, 'private-provider-code', 'SUMMARY_CONFIG'],
+    [429, 'private-provider-code', 'SUMMARY_RATE_LIMIT'],
+    [500, 'private-provider-code', 'SUMMARY_SERVICE_UNAVAILABLE'],
   ]) {
     await assert.rejects(build(async () => Response.json({ error: { code, message: 'private token detail' } }, { status }))(messages), error => {
       assert.equal(error.code, expected);
+      assert.equal(error.status, status);
       assert.doesNotMatch(error.message, /private token detail/);
       return true;
     });

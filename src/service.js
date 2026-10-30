@@ -4,6 +4,41 @@ const MAX_REPLY_LENGTH = 3500;
 const COMMAND_TTL_MS = 60 * 60 * 1000;
 const MAX_REMEMBERED_COMMANDS = 1000;
 
+// Fixed guidance also defines the allowlist for diagnostic codes. Never log
+// arbitrary provider errors: they can contain transcript text or credentials.
+const FAILURE_MESSAGES = Object.freeze({
+  PLAN_LIMIT: 'The bot has reached its ChatGPT usage limit. The owner can check ChatGPT Settings > Usage before trying again.',
+  PLAN_UNAVAILABLE: 'ChatGPT plan usage is temporarily unavailable. Please try again later; the owner can check ChatGPT Settings > Usage.',
+  PLAN_NOT_ELIGIBLE: 'ChatGPT plan usage is unavailable for the connected account or workspace. The bot owner needs to check its access.',
+  UNSUPPORTED_CAPABILITY: 'The configured model or request feature is unavailable through ChatGPT sign-in. The bot owner needs to check the summary configuration.',
+  AUTH_REQUIRED: 'The bot owner needs to reconnect ChatGPT before summaries can continue.',
+  AUTH_UNAVAILABLE: 'ChatGPT authentication is temporarily unavailable. Please try again shortly.',
+  AUTH_DENIED: 'The bot owner needs to reconnect ChatGPT and authorise plan usage before summaries can continue.',
+  SUBSCRIPTION_NOT_ENABLED: 'The bot owner needs to authorise ChatGPT plan usage before summaries can continue.',
+  MODEL_UNAVAILABLE: 'The configured summary model is unavailable. The bot owner needs to choose another available model.',
+  MODEL_NOT_FOUND: 'The configured summary model could not be accessed. The bot owner needs to check the model name and account access.',
+  API_AUTH_FAILED: 'The summary service rejected the bot’s API credentials. The bot owner needs to check its configuration.',
+  API_ACCESS_DENIED: 'The bot does not have permission to use the summary service. The bot owner needs to check its access.',
+  SUMMARY_RATE_LIMIT: 'The summary service reached a request or usage limit. Please try again later; the bot owner can check its usage.',
+  SUMMARY_SERVICE_UNAVAILABLE: 'The summary service is temporarily unavailable. Please try again later.',
+  SUMMARY_CONFIG: 'The summary service rejected the request configuration. The bot owner needs to check the summary diagnostic in the service logs.',
+  SUMMARY_NETWORK: 'The bot could not reach the summary service. Please try again in a moment.',
+  SUMMARY_TIMEOUT: 'The summary service took too long to respond. Please try again with a new !summarise command, or choose a shorter range.',
+  SUMMARY_UNREADABLE: 'The summary service returned an unreadable response. Please try again with a new !summarise command.',
+  SUMMARY_INCOMPLETE: 'The summary service stopped before completing the summary. Please try again with a shorter range.',
+  SUMMARY_EMPTY: 'The summary service returned no summary. Please try again with a new !summarise command.',
+  SUMMARY_REFUSED: 'The summary service could not summarise this selection. Please try a different range.',
+  SUMMARY_STREAM_INTERRUPTED: 'The connection to the summary service ended before the summary was complete. Please try again with a new !summarise command.',
+  OUTPUT_TOO_LARGE: 'The summary response was too large. Please try again with a shorter range.',
+  INPUT_TOO_LARGE: 'That conversation is too long for one summary. Reply to a newer starting message and send !summarise again.',
+  SUMMARY_FAILED: 'I could not complete the summary. Please try again with a new !summarise command in a moment.',
+});
+
+function failureCode(error) {
+  return typeof error?.code === 'string' && Object.hasOwn(FAILURE_MESSAGES, error.code)
+    ? error.code : 'SUMMARY_FAILED';
+}
+
 export function isSummariseCommand(text) {
   return typeof text === 'string' && /(?:^|\s)!summarise(?=\s|$)/i.test(text);
 }
@@ -102,22 +137,32 @@ export function createSummaryService({
     }
 
     activeGroups.add(groupId);
+    let stage = 'history';
+    let retrieved = null;
+    let selected = null;
+    const startedAt = now();
+    const send = async text => {
+      stage = 'delivery';
+      await reply(groupId, id, text);
+    };
     try {
       if (!quotedId) {
-        await reply(groupId, id, 'Reply to the first message you want included, then mention the bot and send !summarise.');
+        await send('Reply to the first message you want included, then mention the bot and send !summarise.');
         return 'missing-quote';
       }
 
       const loaded = await loadMessages({ groupId, startId: quotedId, endId: id });
+      stage = 'preparation';
       const rows = Array.isArray(loaded) ? loaded : loaded?.messages;
       const coverageIncomplete = !Array.isArray(loaded) && loaded?.coverageIncomplete === true;
       if (!Array.isArray(rows)) throw new Error('Invalid history result');
+      retrieved = rows.length;
       const snapshot = rows
         .filter(row => row.groupId === groupId && row.id !== id)
         .map(row => ({ ...row }));
       const anchor = snapshot.find(row => row.id === quotedId);
       if (!anchor) {
-        await reply(groupId, id, 'I could not retrieve that starting message from WhatsApp. Reply to a newer starting message and try !summarise again.');
+        await send('I could not retrieve that starting message from WhatsApp. Reply to a newer starting message and try !summarise again.');
         return 'missing-history';
       }
 
@@ -126,8 +171,9 @@ export function createSummaryService({
       const messages = eligible
         .filter(row => typeof row.text === 'string' && row.text.trim())
         .map(row => ({ ...row, text: row.text.trim() }));
+      selected = messages.length;
       if (messages.length === 0) {
-        await reply(groupId, id, 'There are no available text messages or captions to summarise in that range. Voice notes, images without captions, deleted messages and bot replies are not included.');
+        await send('There are no available text messages or captions to summarise in that range. Voice notes, images without captions, deleted messages and bot replies are not included.');
         return 'empty';
       }
 
@@ -142,13 +188,17 @@ export function createSummaryService({
 
       // Another group may have exhausted the shared allowance during this fetch.
       if (planPaused) {
-        await reply(groupId, id, 'Summaries are paused because the bot reached its ChatGPT usage limit. The bot owner needs to restore access before summaries can continue.');
+        await send('Summaries are paused because the bot reached its ChatGPT usage limit. The bot owner needs to restore access before summaries can continue.');
         return 'plan-paused';
       }
+      stage = 'generation';
       const summary = await summarize(messages);
-      if (typeof summary !== 'string' || !summary.trim()) throw new Error('Empty summary');
+      if (typeof summary !== 'string' || !summary.trim()) {
+        throw Object.assign(new Error('Empty summary'), { code: 'SUMMARY_EMPTY' });
+      }
+      stage = 'formatting';
       for (const chunk of splitReply(`${header}\n\n${summary.trim()}${footer}`)) {
-        await reply(groupId, id, chunk);
+        await send(chunk);
       }
       lastSuccess.set(groupId, now());
       return 'summarised';
@@ -159,26 +209,28 @@ export function createSummaryService({
           ? error.message : 'WhatsApp history is unavailable.';
         try { onError(`History retrieval failed: ${detail}`); }
         catch { /* Diagnostics must not prevent the recovery reply. */ }
+      } else {
+        const diagnostic = {
+          stage, code: failureCode(error), retrieved, selected,
+          elapsedMs: Math.max(0, Math.round(now() - startedAt)),
+        };
+        if (Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599) {
+          diagnostic.httpStatus = error.status;
+        }
+        if (['max_output_tokens', 'content_filter', 'unknown'].includes(error?.reason)) {
+          diagnostic.reason = error.reason;
+        }
+        try { onError(`Summary diagnostic: ${JSON.stringify(diagnostic)}`); }
+        catch { /* Diagnostics must not prevent the recovery reply. */ }
       }
       if (error?.code === 'PLAN_LIMIT') {
         planPaused = true;
         try { onPause(); } catch { /* Logging must not prevent the user-facing reply. */ }
       }
-      const planMessages = {
-        PLAN_LIMIT: 'The bot has reached its ChatGPT usage limit. The owner can check ChatGPT Settings > Usage before trying again.',
-        PLAN_UNAVAILABLE: 'ChatGPT plan usage is temporarily unavailable. Please try again later; the owner can check ChatGPT Settings > Usage.',
-        AUTH_REQUIRED: 'The bot owner needs to reconnect ChatGPT before summaries can continue.',
-        AUTH_UNAVAILABLE: 'ChatGPT authentication is temporarily unavailable. Please try again shortly.',
-        AUTH_DENIED: 'The bot owner needs to reconnect ChatGPT and authorise plan usage before summaries can continue.',
-        SUBSCRIPTION_NOT_ENABLED: 'The bot owner needs to authorise ChatGPT plan usage before summaries can continue.',
-        MODEL_UNAVAILABLE: 'The configured summary model is unavailable. The bot owner needs to choose another available model.',
-      };
       const message = error instanceof HistoryUnavailableError ? error.message
-        : planMessages[error?.code] || (error?.code === 'HISTORY_UNAVAILABLE'
+        : error?.code === 'HISTORY_UNAVAILABLE'
         ? 'I could not retrieve that starting message or the requested range from WhatsApp. Keep the bot phone online, then reply to a newer starting message and try !summarise again.'
-        : error?.code === 'INPUT_TOO_LARGE'
-          ? 'That conversation is too long for one summary. Reply to a newer starting message and send !summarise again.'
-          : 'I could not complete the summary. Please try again with a new !summarise command in a moment.');
+        : FAILURE_MESSAGES[failureCode(error)];
       // Do not include API errors, tokens or internal message IDs in chat.
       await reply(groupId, id, message);
       return 'failed';

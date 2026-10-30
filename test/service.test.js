@@ -30,7 +30,7 @@ function fixture(options = {}) {
       return rows.filter(item => item.groupId === request.groupId);
     },
     summarize: options.summarize ?? (async messages => { inputs.push(messages); return 'Plan agreed: meet at noon.'; }),
-    reply: async (groupId, id, text) => { replies.push({ groupId, id, text }); },
+    reply: options.reply ?? (async (groupId, id, text) => { replies.push({ groupId, id, text }); }),
     now: () => clock,
     cooldownMs: options.cooldownMs ?? 30_000,
     onError: options.onError,
@@ -245,6 +245,95 @@ test('a diagnostic callback failure does not hide the history recovery guidance'
   assert.equal(await f.request(), 'failed');
   assert.equal(f.replies[0].text, guidance);
   assert.equal(f.inputs.length, 0);
+});
+
+test('summary diagnostics distinguish retrieval counts from selected text without exposing errors', async () => {
+  const logs = [];
+  const f = fixture({
+    rows: [row('anchor'), row('previous-command', { isCommand: true }), row('audio', { text: '' })],
+    summarize: async () => {
+      f.advance(120_000);
+      throw Object.assign(new Error('secret transcript and token'), {
+        code: 'SUMMARY_TIMEOUT', status: 504, reason: 'secret reason', body: 'secret body',
+      });
+    },
+    onError: text => logs.push(text),
+  });
+  assert.equal(await f.request(), 'failed');
+  assert.deepEqual(logs, ['Summary diagnostic: {"stage":"generation","code":"SUMMARY_TIMEOUT","retrieved":3,"selected":1,"elapsedMs":120000,"httpStatus":504}']);
+  assert.match(f.replies[0].text, /took too long/);
+  assert.doesNotMatch(logs.join('') + f.replies[0].text, /secret|friends@g.us|anchor|Message/);
+});
+
+test('untrusted error codes and metadata cannot enter summary logs or replies', async () => {
+  for (const code of ['secret\nforged log', 'toString', '__proto__', undefined]) {
+    const logs = [];
+    const f = fixture({
+      summarize: async () => { throw Object.assign(new Error('secret message'), {
+        code, status: 'secret status', reason: 'secret reason',
+      }); },
+      onError: text => logs.push(text),
+    });
+    assert.equal(await f.request(), 'failed');
+    assert.equal(logs.length, 1);
+    assert.equal(JSON.parse(logs[0].slice('Summary diagnostic: '.length)).code, 'SUMMARY_FAILED');
+    assert.doesNotMatch(logs.join('') + f.replies[0].text, /secret|forged|toString|__proto__/);
+  }
+});
+
+test('preparation, history and delivery failures are distinguishable from generation failures', async () => {
+  for (const [stage, options] of [
+    ['history', { loadMessages: async () => { throw new Error('secret history detail'); } }],
+    ['preparation', { rows: [row('anchor', { timestamp: NaN })] }],
+    ['delivery', { reply: async () => { throw new Error('secret delivery detail'); } }],
+  ]) {
+    const logs = [];
+    const f = fixture({ ...options, onError: text => logs.push(text) });
+    if (stage === 'delivery') await assert.rejects(f.request(), /secret delivery detail/);
+    else assert.equal(await f.request(), 'failed');
+    assert.equal(JSON.parse(logs[0].slice('Summary diagnostic: '.length)).stage, stage);
+    assert.doesNotMatch(logs.join(''), /secret/);
+  }
+});
+
+test('incomplete reasons are allowlisted and diagnostic callback failures preserve guidance', async () => {
+  const logs = [];
+  const f = fixture({
+    summarize: async () => { throw Object.assign(new Error('private partial output'), {
+      code: 'SUMMARY_INCOMPLETE', reason: 'max_output_tokens', status: 999,
+    }); },
+    onError: text => { logs.push(text); throw new Error('logging failed'); },
+  });
+  assert.equal(await f.request(), 'failed');
+  const diagnostic = JSON.parse(logs[0].slice('Summary diagnostic: '.length));
+  assert.equal(diagnostic.reason, 'max_output_tokens');
+  assert.equal(diagnostic.httpStatus, undefined);
+  assert.match(f.replies[0].text, /stopped before completing/);
+  assert.doesNotMatch(logs.join('') + f.replies[0].text, /private|partial|logging failed/);
+});
+
+test('new provider failure categories give actionable fixed guidance', async () => {
+  for (const [code, expected] of [
+    ['PLAN_NOT_ELIGIBLE', /account or workspace/],
+    ['UNSUPPORTED_CAPABILITY', /model or request feature/],
+    ['API_AUTH_FAILED', /API credentials/],
+    ['API_ACCESS_DENIED', /permission/],
+    ['SUMMARY_RATE_LIMIT', /request or usage limit/],
+    ['SUMMARY_SERVICE_UNAVAILABLE', /temporarily unavailable/],
+    ['SUMMARY_CONFIG', /configuration/],
+    ['SUMMARY_NETWORK', /could not reach/],
+    ['SUMMARY_UNREADABLE', /unreadable response/],
+    ['SUMMARY_EMPTY', /no summary/],
+    ['SUMMARY_REFUSED', /different range/],
+    ['SUMMARY_STREAM_INTERRUPTED', /connection.*ended/i],
+    ['OUTPUT_TOO_LARGE', /response was too large/],
+    ['MODEL_NOT_FOUND', /model name and account access/],
+  ]) {
+    const f = fixture({ summarize: async () => { throw Object.assign(new Error('private detail'), { code }); } });
+    assert.equal(await f.request(), 'failed');
+    assert.match(f.replies[0].text, expected);
+    assert.doesNotMatch(f.replies[0].text, /private detail/);
+  }
 });
 
 test('deduplicates replayed command IDs in memory and expires them after one hour', async () => {

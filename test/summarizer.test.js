@@ -75,10 +75,15 @@ test('does not expose provider response bodies for HTTP failures', async () => {
     apiKey: 'unit-test-secret',
     fetchImpl: async () => ({
       ok: false, status: 429,
-      json: async () => assert.fail('Error body must not be read'),
+      json: async () => ({ error: { code: 'private-provider-code', message: 'unit-test-secret Dinner on Friday?' } }),
     }),
   });
-  await assert.rejects(summarize(messages), /busy or out of credit/);
+  await assert.rejects(summarize(messages), error => {
+    assert.equal(error.code, 'SUMMARY_RATE_LIMIT');
+    assert.equal(error.status, 429);
+    assert.doesNotMatch(`${error.message} ${JSON.stringify(error)}`, /private-provider-code|unit-test-secret|Dinner on Friday/);
+    return true;
+  });
 });
 
 test('sanitises network errors', async () => {
@@ -86,7 +91,7 @@ test('sanitises network errors', async () => {
     apiKey: 'test',
     fetchImpl: async () => { throw new Error('secret-message-content'); },
   });
-  await assert.rejects(summarize(messages), { message: 'Could not reach the summary service. Please try again later.' });
+  await assert.rejects(summarize(messages), { code: 'SUMMARY_NETWORK', message: 'Could not reach the summary service. Please try again later.' });
 });
 
 test('rejects incomplete output rather than presenting a truncated summary', async () => {
@@ -94,16 +99,62 @@ test('rejects incomplete output rather than presenting a truncated summary', asy
     apiKey: 'test',
     fetchImpl: async () => fakeResponse({ ...completed('Partial summary'), status: 'incomplete' }),
   });
-  await assert.rejects(summarize(messages), /did not finish/);
+  await assert.rejects(summarize(messages), { code: 'SUMMARY_INCOMPLETE', reason: 'unknown' });
 });
 
 test('rejects empty or malformed model output', async (t) => {
   for (const result of [completed(' '), { status: 'completed', output: null }, { status: 'completed', output: [null] }]) {
     await t.test(JSON.stringify(result), async () => {
       const summarize = createSummarizer({ apiKey: 'test', fetchImpl: async () => fakeResponse(result) });
-      await assert.rejects(summarize(messages), /no summary/);
+      await assert.rejects(summarize(messages), { code: 'SUMMARY_EMPTY' });
     });
   }
+});
+
+test('classifies HTTP failures using status and allowlisted codes without exposing provider details', async () => {
+  for (const [status, providerCode, expected] of [
+    [401, 'secret-auth-detail', 'API_AUTH_FAILED'],
+    [403, 'secret-permission-detail', 'API_ACCESS_DENIED'],
+    [429, 'secret-quota-detail', 'SUMMARY_RATE_LIMIT'],
+    [503, 'secret-service-detail', 'SUMMARY_SERVICE_UNAVAILABLE'],
+    [400, 'secret-request-detail', 'SUMMARY_CONFIG'],
+    [404, 'model_not_found', 'MODEL_NOT_FOUND'],
+  ]) {
+    let calls = 0;
+    const summarize = createSummarizer({ apiKey: 'secret-token', fetchImpl: async () => {
+      calls++;
+      return fakeResponse({ error: { code: providerCode, message: 'secret-transcript secret-token' } }, status);
+    } });
+    await assert.rejects(summarize(messages), error => {
+      assert.equal(error.code, expected);
+      assert.equal(error.status, status);
+      assert.doesNotMatch(`${error.message} ${JSON.stringify(error)}`, /secret-/);
+      return true;
+    });
+    assert.equal(calls, 1);
+  }
+});
+
+test('classifies unreadable, refused and incomplete responses without retaining sensitive details', async () => {
+  const fixtures = [
+    [null, 'SUMMARY_UNREADABLE'],
+    [{ status: 'failed', error: { code: 'model_not_found', message: 'secret-provider-text' } }, 'MODEL_NOT_FOUND'],
+    [{ status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'refusal', refusal: 'secret-refusal' }] }] }, 'SUMMARY_REFUSED'],
+  ];
+  for (const [result, code] of fixtures) {
+    await assert.rejects(createSummarizer({ apiKey: 'secret-token', fetchImpl: async () => fakeResponse(result) })(messages), error => {
+      assert.equal(error.code, code);
+      assert.doesNotMatch(`${error.message} ${JSON.stringify(error)}`, /secret-/);
+      return true;
+    });
+  }
+  for (const reason of ['max_output_tokens', 'content_filter', 'secret-reason']) {
+    const summarize = createSummarizer({ apiKey: 'test', fetchImpl: async () => fakeResponse({
+      status: 'incomplete', incomplete_details: { reason }, output: completed('secret-partial').output,
+    }) });
+    await assert.rejects(summarize(messages), { code: 'SUMMARY_INCOMPLETE', reason: reason === 'secret-reason' ? 'unknown' : reason });
+  }
+  await assert.rejects(createSummarizer({ apiKey: 'test', fetchImpl: async () => ({ ok: true, json: async () => { throw new Error('secret-json'); } }) })(messages), { code: 'SUMMARY_UNREADABLE' });
 });
 
 test('rejects malformed transcripts before sending them', async () => {
